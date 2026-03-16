@@ -377,6 +377,29 @@ async function handleTelegramWebhook(request, env) {
     return json({ ok: true, handled: true, command }, 200);
   }
 
+  if (command === "admin" && plan.isAdmin) {
+    const historyState = await getHistoryState(env, chatId, plan);
+
+    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildAdminMessage(chatId), {
+      parse_mode: "HTML",
+      reply_markup: buildAdminKeyboard(historyState),
+    });
+
+    return json({ ok: true, handled: true, command }, 200);
+  }
+
+  if (command === "stats" && plan.isAdmin) {
+    const historyState = await getHistoryState(env, chatId, plan);
+    const stats = await getAdminStats(env, chatId, historyState);
+
+    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildStatsMessage(stats), {
+      parse_mode: "HTML",
+      reply_markup: buildAdminKeyboard(historyState),
+    });
+
+    return json({ ok: true, handled: true, command }, 200);
+  }
+
   if (command === "history") {
     const historyState = await getHistoryState(env, chatId, plan);
 
@@ -506,7 +529,7 @@ async function handleTelegramWebhook(request, env) {
 
     await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildNewEmailMessage(result.payload, historyRecord), {
       parse_mode: "HTML",
-      reply_markup: buildMailboxKeyboard(result.payload.email, historyRecord),
+      reply_markup: buildMailboxKeyboard(result.payload.email, historyRecord, result.payload),
     });
 
     return json({ ok: true, handled: true, command, email: result.payload.email }, 200);
@@ -563,7 +586,7 @@ async function handleTelegramWebhook(request, env) {
 
     await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildImportSuccessMessage(inboxResult.payload, historyRecord), {
       parse_mode: "HTML",
-      reply_markup: buildMailboxKeyboard(inboxResult.payload.email, historyRecord),
+      reply_markup: buildMailboxKeyboard(inboxResult.payload.email, historyRecord, inboxResult.payload),
     });
 
     return json({ ok: true, handled: true, command, email: inboxResult.payload.email }, 200);
@@ -604,7 +627,7 @@ async function handleTelegramWebhook(request, env) {
       buildInboxMessage(inboxResult.payload, { refreshed: command === "refresh" }),
       {
         parse_mode: "HTML",
-        reply_markup: buildMailboxKeyboard(inboxResult.payload.email, historyState),
+        reply_markup: buildMailboxKeyboard(inboxResult.payload.email, historyState, inboxResult.payload),
       },
     );
 
@@ -680,7 +703,7 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
       await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Email baru dibuat.");
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildNewEmailMessage(result.payload, historyRecord), {
         parse_mode: "HTML",
-        reply_markup: buildMailboxKeyboard(result.payload.email, historyRecord),
+        reply_markup: buildMailboxKeyboard(result.payload.email, historyRecord, result.payload),
       });
 
       return json({ ok: true, handled: true, callback: data, email: result.payload.email }, 200);
@@ -693,6 +716,31 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildHistoryMessage(historyState), {
         parse_mode: "HTML",
         reply_markup: buildHistorySelectorKeyboard(historyState, 0),
+      });
+
+      return json({ ok: true, handled: true, callback: data }, 200);
+    }
+
+    if (data === "admin" && plan.isAdmin) {
+      const historyState = await getHistoryState(env, chatId, plan);
+
+      await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Admin tools dibuka.");
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildAdminMessage(chatId), {
+        parse_mode: "HTML",
+        reply_markup: buildAdminKeyboard(historyState),
+      });
+
+      return json({ ok: true, handled: true, callback: data }, 200);
+    }
+
+    if (data === "stats" && plan.isAdmin) {
+      const historyState = await getHistoryState(env, chatId, plan);
+      const stats = await getAdminStats(env, chatId, historyState);
+
+      await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Stats dikirim.");
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildStatsMessage(stats), {
+        parse_mode: "HTML",
+        reply_markup: buildAdminKeyboard(historyState),
       });
 
       return json({ ok: true, handled: true, callback: data }, 200);
@@ -739,11 +787,104 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
       return json({ ok: true, handled: true, callback: data }, 200);
     }
 
+    if (data.startsWith("copy_")) {
+      const historyState = await getHistoryState(env, chatId, plan);
+      const botText = String(callbackQuery?.message?.text || "");
+      const copyResult = buildCopyPayloadFromBotText(data, botText, historyState);
+
+      if (!copyResult.ok) {
+        await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, copyResult.error || "Data tidak tersedia.", true);
+        return json({ ok: true, handled: true, callback: data, error: copyResult.error }, 200);
+      }
+
+      await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, copyResult.notice || "Siap dicopy.");
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, `<code>${escapeHtml(copyResult.value)}</code>`, {
+        parse_mode: "HTML",
+        reply_markup: buildMailboxKeyboard(copyResult.email, historyState, copyResult.payload || null),
+      });
+
+      return json({ ok: true, handled: true, callback: data }, 200);
+    }
+
     const separator = data.indexOf(":");
     const action = separator >= 0 ? data.slice(0, separator) : data;
     const rawLocalPart = separator >= 0 ? data.slice(separator + 1) : "";
-    const mailbox = parseMailboxReference(rawLocalPart);
     const historyState = await getHistoryState(env, chatId, plan);
+
+    if (action === "openmsg" || action === "delmsg") {
+      const targetEmail = extractEmailFromText(callbackQuery?.message?.text || "");
+      const historyEntry = targetEmail ? findHistoryEntry(historyState, targetEmail) : null;
+
+      if (!targetEmail || !historyEntry) {
+        await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Email belum ada di history.", true);
+        return json({ ok: true, handled: true, callback: data, error: "Email belum ada di history." }, 200);
+      }
+
+      if (action === "openmsg") {
+        const fullMessageResult = await getMailboxMessageDetail(targetEmail, historyEntry, rawLocalPart);
+
+        if (!fullMessageResult.ok) {
+          await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Pesan gagal dibuka.", true);
+          await sendTelegramMessage(
+            env.TELEGRAM_BOT_TOKEN,
+            chatId,
+            `Gagal membuka pesan.\n\n${escapeHtml(fullMessageResult.error)}`,
+            { parse_mode: "HTML" },
+          );
+
+          return json({ ok: false, handled: true, callback: data, error: fullMessageResult.error }, 502);
+        }
+
+        await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Pesan dibuka.");
+        await sendTelegramMessage(
+          env.TELEGRAM_BOT_TOKEN,
+          chatId,
+          buildFullMessageText(fullMessageResult.payload),
+          {
+            parse_mode: "HTML",
+            reply_markup: buildMessageDetailKeyboard(targetEmail, historyState, fullMessageResult.payload),
+          },
+        );
+
+        return json({ ok: true, handled: true, callback: data, email: targetEmail }, 200);
+      }
+
+      const deleteResult = await deleteMailboxMessage(targetEmail, historyEntry, rawLocalPart);
+
+      if (!deleteResult.ok) {
+        await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Pesan gagal dihapus.", true);
+        await sendTelegramMessage(
+          env.TELEGRAM_BOT_TOKEN,
+          chatId,
+          `Gagal menghapus pesan.\n\n${escapeHtml(deleteResult.error)}`,
+          { parse_mode: "HTML" },
+        );
+
+        return json({ ok: false, handled: true, callback: data, error: deleteResult.error }, 502);
+      }
+
+      const inboxResult = await getMailboxInbox(request, historyEntry.localPart, {
+        displayEmail: targetEmail,
+        historyEntry,
+      });
+
+      await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Pesan dihapus.");
+      await sendTelegramMessage(
+        env.TELEGRAM_BOT_TOKEN,
+        chatId,
+        inboxResult.ok
+          ? buildInboxMessage(inboxResult.payload, { refreshed: true })
+          : "Pesan dihapus, tapi inbox belum bisa dimuat ulang.",
+        {
+          parse_mode: "HTML",
+          reply_markup: buildMailboxKeyboard(targetEmail, historyState, inboxResult.ok ? inboxResult.payload : null),
+        },
+      );
+
+      return json({ ok: true, handled: true, callback: data, email: targetEmail }, 200);
+    }
+
+    const mailbox = parseMailboxReference(rawLocalPart);
     const historyEntry = mailbox.ok ? findHistoryEntry(historyState, mailbox.email || mailbox.localPart) : null;
     const targetEmail = historyEntry?.email || mailbox.email;
 
@@ -793,7 +934,7 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
       await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Kirim catatan untuk email ini.");
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildNotePromptMessage(targetEmail), {
         parse_mode: "HTML",
-        reply_markup: buildMailboxKeyboard(targetEmail, historyState),
+        reply_markup: buildMailboxKeyboard(targetEmail, historyState, historyEntry ? { email: targetEmail } : null),
         reply_parameters: callbackQuery?.message?.message_id
           ? { message_id: callbackQuery.message.message_id }
           : undefined,
@@ -835,7 +976,7 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
       buildInboxMessage(inboxResult.payload, { refreshed: action === "refresh" }),
       {
         parse_mode: "HTML",
-        reply_markup: buildMailboxKeyboard(inboxResult.payload.email, historyState),
+        reply_markup: buildMailboxKeyboard(inboxResult.payload.email, historyState, inboxResult.payload),
       },
     );
 
@@ -901,7 +1042,7 @@ async function handlePendingTelegramInput(request, env, message, text, pendingAc
       buildImportSuccessMessage(inboxResult.payload, historyRecord),
       {
         parse_mode: "HTML",
-        reply_markup: buildMailboxKeyboard(inboxResult.payload.email, historyRecord),
+        reply_markup: buildMailboxKeyboard(inboxResult.payload.email, historyRecord, inboxResult.payload),
       },
     );
 
@@ -1127,6 +1268,13 @@ async function createMailTmToken(address, password) {
   });
 
   if (!result.ok || !result.data?.token) {
+    if (result.status === 401) {
+      return {
+        ok: false,
+        error: "Email atau password salah. Untuk email luar bot, gunakan format: /import email@domain.tld password",
+      };
+    }
+
     return { ok: false, error: result.error || "Gagal login ke inbox email." };
   }
 
@@ -1143,6 +1291,89 @@ async function fetchMailTmMessages(token) {
   return {
     ok: true,
     messages: extractHydraMembers(result.data).map((item) => normalizeMailboxMessage(item)),
+  };
+}
+
+async function fetchMailTmMessageById(token, messageId) {
+  const result = await fetchMailTmJson(`/messages/${encodeURIComponent(messageId)}`, { token });
+
+  if (!result.ok) {
+    return { ok: false, error: result.error };
+  }
+
+  return {
+    ok: true,
+    message: normalizeFullMailboxMessage(result.data),
+  };
+}
+
+async function deleteMailTmMessage(token, messageId) {
+  const result = await fetchMailTmJson(`/messages/${encodeURIComponent(messageId)}`, {
+    method: "DELETE",
+    token,
+  });
+
+  if (!result.ok && result.status !== 204) {
+    return { ok: false, error: result.error };
+  }
+
+  return { ok: true };
+}
+
+async function getMailboxMessageDetail(email, historyEntry, messageId) {
+  const password = String(historyEntry?.passwordSuggestion || historyEntry?.mailboxPassword || "").trim();
+
+  if (!email || !password) {
+    return { ok: false, error: "Data inbox tidak lengkap. Refresh inbox dulu." };
+  }
+
+  const tokenResult = await createMailTmToken(email, password);
+
+  if (!tokenResult.ok) {
+    return { ok: false, error: tokenResult.error };
+  }
+
+  const messageResult = await fetchMailTmMessageById(tokenResult.token, messageId);
+
+  if (!messageResult.ok) {
+    return { ok: false, error: messageResult.error };
+  }
+
+  return {
+    ok: true,
+    payload: {
+      ...messageResult.message,
+      email,
+    },
+  };
+}
+
+async function deleteMailboxMessage(email, historyEntry, messageId) {
+  const password = String(historyEntry?.passwordSuggestion || historyEntry?.mailboxPassword || "").trim();
+
+  if (!email || !password) {
+    return { ok: false, error: "Data inbox tidak lengkap. Refresh inbox dulu." };
+  }
+
+  const tokenResult = await createMailTmToken(email, password);
+
+  if (!tokenResult.ok) {
+    return { ok: false, error: tokenResult.error };
+  }
+
+  return deleteMailTmMessage(tokenResult.token, messageId);
+}
+
+async function getAdminStats(env, chatId, historyState) {
+  const domainsResult = await fetchAvailableDomains();
+
+  return {
+    provider: "mail.tm",
+    domainCount: domainsResult.ok ? domainsResult.domains.length : 0,
+    historyCount: historyState.count,
+    planName: formatPlanName(historyState),
+    premiumConfiguredCount: parsePremiumChatIds(env?.PREMIUM_CHAT_IDS).size,
+    chatId,
   };
 }
 
@@ -1825,7 +2056,7 @@ function isHistoryLimitReached(historyState) {
 }
 
 function buildStartMessage(historyState) {
-  return [
+  const lines = [
     "<b>TempMGen siap dipakai</b>",
     "",
     "Domain: <code>otomatis dari sistem</code>",
@@ -1842,7 +2073,13 @@ function buildStartMessage(historyState) {
     "<code>/inbox email</code> - lihat inbox",
     "<code>/refresh email</code> - refresh inbox",
     "<code>/start</code> - tampilkan bantuan ini",
-  ].join("\n");
+  ];
+
+  if (historyState.isAdmin) {
+    lines.push("<code>/admin</code> - buka admin tools", "<code>/stats</code> - lihat ringkasan bot");
+  }
+
+  return lines.join("\n");
 }
 
 function buildNewEmailMessage(payload, historyState) {
@@ -2161,6 +2398,52 @@ function buildInboxMessage(payload, options = {}) {
   return lines.join("\n");
 }
 
+function buildFullMessageText(payload) {
+  const lines = [
+    "<b>Isi pesan lengkap</b>",
+    "",
+    `<code>${escapeHtml(payload.email)}</code>`,
+    `Dari: <code>${escapeHtml(payload.from || "unknown")}</code>`,
+    `Subjek: <code>${escapeHtml(payload.subject || "Tanpa subjek")}</code>`,
+    `Waktu: <code>${escapeHtml(payload.date || "-")}</code>`,
+  ];
+
+  if (payload.otpCodes?.length) {
+    lines.push("", "OTP terdeteksi:");
+    for (const code of payload.otpCodes) {
+      lines.push(`<code>${escapeHtml(code)}</code>`);
+    }
+  }
+
+  lines.push("", escapeHtml(payload.body || payload.excerpt || "(isi pesan kosong)"));
+
+  return lines.join("\n");
+}
+
+function buildAdminMessage(chatId) {
+  return [
+    "<b>Admin tools</b>",
+    "",
+    `Admin: <code>@${escapeHtml(ADMIN_TELEGRAM_USERNAME)}</code>`,
+    `Chat ID: <code>${escapeHtml(String(chatId))}</code>`,
+    "",
+    "Gunakan tombol di bawah untuk lihat statistik bot.",
+  ].join("\n");
+}
+
+function buildStatsMessage(stats) {
+  return [
+    "<b>Ringkasan bot</b>",
+    "",
+    `Provider: <code>${escapeHtml(stats.provider)}</code>`,
+    `Domain aktif: <code>${escapeHtml(String(stats.domainCount))}</code>`,
+    `History chat ini: <code>${escapeHtml(String(stats.historyCount))}</code>`,
+    `Paket chat ini: <code>${escapeHtml(stats.planName)}</code>`,
+    `Premium via secret: <code>${escapeHtml(String(stats.premiumConfiguredCount))}</code>`,
+    `Chat ID: <code>${escapeHtml(String(stats.chatId))}</code>`,
+  ].join("\n");
+}
+
 function buildImportUsageMessage(error) {
   return [
     "<b>Format import email</b>",
@@ -2233,10 +2516,14 @@ function buildHomeKeyboard(historyState) {
     rows.push([{ text: "Pembelian 5k/bulan", url: ADMIN_TELEGRAM_URL }]);
   }
 
+  if (historyState.isAdmin) {
+    rows.push([{ text: "Admin Tools", callback_data: "admin" }]);
+  }
+
   return { inline_keyboard: rows };
 }
 
-function buildMailboxKeyboard(targetEmail, historyState) {
+function buildMailboxKeyboard(targetEmail, historyState, payload = null) {
   const reference = parseMailboxReference(targetEmail);
   const key = reference.ok ? reference.email : String(targetEmail ?? "");
   const rows = [
@@ -2249,20 +2536,75 @@ function buildMailboxKeyboard(targetEmail, historyState) {
       { text: "Pindah Email", callback_data: "history_select:0" },
     ],
     [
+      { text: "Copy Email", callback_data: "copy_email" },
+      { text: "Copy OTP", callback_data: "copy_otp" },
+    ],
+    [
+      { text: "Copy Password", callback_data: "copy_password" },
+      { text: "Copy VCC", callback_data: "copy_vcc" },
+    ],
+    [
+      { text: "Copy CVV", callback_data: "copy_cvv" },
       { text: "Catatan", callback_data: `note_prompt:${key}` },
+    ],
+    [
       { text: "Hapus Email", callback_data: `delete:${key}` },
+      { text: "Import Email", callback_data: "import_prompt" },
     ],
     [
       { text: "Email Baru", callback_data: "new" },
-      { text: "Import Email", callback_data: "import_prompt" },
+      { text: "History", callback_data: "history" },
     ],
   ];
+
+  if (payload?.messages?.length) {
+    for (const [index, message] of payload.messages.slice(0, 3).entries()) {
+      rows.push([
+        { text: `Open ${index + 1}`, callback_data: `openmsg:${message.id}` },
+        { text: `Delete ${index + 1}`, callback_data: `delmsg:${message.id}` },
+      ]);
+    }
+  }
 
   if (!historyState.isPremium && !historyState.isAdmin) {
     rows.push([{ text: "Pembelian 5k/bulan", url: ADMIN_TELEGRAM_URL }]);
   }
 
+  if (historyState.isAdmin) {
+    rows.push([{ text: "Admin Tools", callback_data: "admin" }]);
+  }
+
   return { inline_keyboard: rows };
+}
+
+function buildMessageDetailKeyboard(targetEmail, historyState, payload) {
+  const reference = parseMailboxReference(targetEmail);
+  const key = reference.ok ? reference.email : String(targetEmail ?? "");
+  const rows = [
+    [
+      { text: "Copy OTP", callback_data: "copy_otp" },
+      { text: "Copy Email", callback_data: "copy_email" },
+    ],
+    [
+      { text: "Refresh Inbox", callback_data: `refresh:${key}` },
+      { text: "Delete Message", callback_data: `delmsg:${payload.id}` },
+    ],
+  ];
+
+  return { inline_keyboard: rows };
+}
+
+function buildAdminKeyboard(historyState) {
+  return {
+    inline_keyboard: [
+      [
+        { text: "Stats", callback_data: "stats" },
+        { text: "History", callback_data: "history" },
+      ],
+      [{ text: "Email Baru", callback_data: "new" }],
+      ...(historyState.isAdmin ? [[{ text: "Admin Tools", callback_data: "admin" }]] : []),
+    ],
+  };
 }
 
 function buildHistorySelectorKeyboard(historyState, page = 0) {
@@ -2560,8 +2902,48 @@ function normalizeMailboxMessage(item) {
   };
 }
 
+function normalizeFullMailboxMessage(item) {
+  const base = normalizeMailboxMessage(item);
+  const body = extractMessageBody(item);
+
+  return {
+    ...base,
+    body: trimText(body, 3500),
+    otpCodes: extractOtpCodes([{ subject: base.subject, excerpt: `${base.excerpt} ${body}` }]),
+  };
+}
+
 function isSystemMailboxMessage(item) {
   return false;
+}
+
+function extractMessageBody(item) {
+  if (typeof item?.text === "string" && item.text.trim()) {
+    return item.text.trim();
+  }
+
+  if (Array.isArray(item?.text) && item.text.length) {
+    return item.text.join("\n").trim();
+  }
+
+  if (typeof item?.html === "string" && item.html.trim()) {
+    return stripHtml(item.html).trim();
+  }
+
+  if (Array.isArray(item?.html) && item.html.length) {
+    return stripHtml(item.html.join("\n")).trim();
+  }
+
+  return String(item?.intro || "").trim();
+}
+
+function stripHtml(value) {
+  return String(value ?? "")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ");
 }
 
 function decodeHtmlEntities(value) {
@@ -2596,6 +2978,86 @@ function formatMessageDate(value) {
   }
 
   return `${date.getUTCFullYear()}-${padNumber(date.getUTCMonth() + 1)}-${padNumber(date.getUTCDate())} ${padNumber(date.getUTCHours())}:${padNumber(date.getUTCMinutes())} UTC`;
+}
+
+function buildCopyPayloadFromBotText(action, botText, historyState) {
+  const email = extractEmailFromText(botText);
+  const historyEntry = email ? findHistoryEntry(historyState, email) : null;
+  const payload = historyEntry
+    ? {
+        email: historyEntry.email,
+        passwordSuggestion: historyEntry.passwordSuggestion || "",
+        vcc: historyEntry.vcc || null,
+        otpCodes: extractOtpCodesFromText(botText),
+      }
+    : {
+        email,
+        passwordSuggestion: extractLabeledValue(botText, "Password saran") || extractLabeledValue(botText, "Password"),
+        vcc: {
+          number: extractNextLineValue(botText, "VCC dummy") || "",
+          expText: extractInlineValue(botText, "Exp") || "",
+          cvv: extractInlineValue(botText, "CVV") || "",
+        },
+        otpCodes: extractOtpCodesFromText(botText),
+      };
+
+  if (action === "copy_email") {
+    return email ? { ok: true, value: email, email, payload, notice: "Email siap dicopy." } : { ok: false, error: "Email belum ada." };
+  }
+
+  if (action === "copy_password") {
+    const value = payload.passwordSuggestion;
+    return value
+      ? { ok: true, value, email, payload, notice: "Password siap dicopy." }
+      : { ok: false, error: "Password belum tersedia." };
+  }
+
+  if (action === "copy_otp") {
+    const value = payload.otpCodes?.[0] || "";
+    return value
+      ? { ok: true, value, email, payload, notice: "OTP siap dicopy." }
+      : { ok: false, error: "OTP belum ditemukan." };
+  }
+
+  if (action === "copy_vcc") {
+    const value = payload.vcc?.number || "";
+    return value
+      ? { ok: true, value, email, payload, notice: "Nomor VCC siap dicopy." }
+      : { ok: false, error: "Nomor VCC belum tersedia." };
+  }
+
+  if (action === "copy_cvv") {
+    const value = payload.vcc?.cvv || "";
+    return value
+      ? { ok: true, value, email, payload, notice: "CVV siap dicopy." }
+      : { ok: false, error: "CVV belum tersedia." };
+  }
+
+  return { ok: false, error: "Aksi copy tidak dikenal." };
+}
+
+function extractEmailFromText(text) {
+  const match = String(text ?? "").match(/[a-z0-9._+-]+@[a-z0-9.-]+\.[a-z]{2,}/i);
+  return match?.[0]?.toLowerCase() || "";
+}
+
+function extractOtpCodesFromText(text) {
+  return Array.from(new Set(String(text ?? "").match(/\b\d{4,8}\b/g) || [])).slice(0, 5);
+}
+
+function extractLabeledValue(text, label) {
+  const lines = String(text ?? "").split(/\r?\n/);
+  const index = lines.findIndex((line) => line.trim().toLowerCase() === `${label.toLowerCase()}:`);
+  return index >= 0 ? String(lines[index + 1] || "").trim() : "";
+}
+
+function extractNextLineValue(text, label) {
+  return extractLabeledValue(text, label);
+}
+
+function extractInlineValue(text, label) {
+  const match = String(text ?? "").match(new RegExp(`${label}:\\s*([^\\n]+)`, "i"));
+  return match?.[1]?.trim() || "";
 }
 
 function normalizeLocalPart(value) {

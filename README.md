@@ -9,6 +9,7 @@ Web app sederhana untuk:
 - sediakan command bot `/start`, `/new`, `/history`, `/delete`, `/note`, `/inbox`, `/refresh`, dan `/import`
 - simpan history email Telegram dengan batas default 5, premium 25, dan admin unlimited
 - tampilkan saran password, VCC dummy, dan OTP yang terdeteksi saat perlu
+- sediakan buka isi email penuh, hapus pesan, dan admin tools dasar
 
 ## Stack
 
@@ -85,7 +86,7 @@ curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<w
 - `/inbox email@domain.tld` membuka inbox email itu
 - `/refresh email@domain.tld` mengambil inbox terbaru untuk email itu
 - `/import email@domain.tld password` memulihkan email lama atau email dari luar bot selama domain masih didukung
-- tombol inline `Inbox`, `Refresh`, `History`, `Hapus History Email`, dan `Pembelian 5k/bulan` ikut dikirim di pesan bot
+- tombol inline untuk `Inbox`, `Refresh`, `Open`, `Delete Message`, `History`, `Import`, `Catatan`, dan `Pembelian 5k/bulan`
 
 ### History email
 
@@ -162,6 +163,7 @@ Catatan admin:
 
 - user Telegram dengan username `@AndiPradanaAr` otomatis dianggap admin
 - admin tidak perlu subscribe dan limit history-nya unlimited
+- admin punya command tambahan `/admin` dan `/stats`
 
 Kalau nanti kamu mau sinkronkan secret Telegram lewat GitHub Actions juga, saya bisa tambahkan step khusus setelah kamu menyiapkan secret GitHub `TELEGRAM_BOT_TOKEN`.
 
