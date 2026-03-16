@@ -187,6 +187,47 @@ h2 {
   font-size: 0.92rem;
 }
 
+.info-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.9rem;
+  margin-bottom: 1rem;
+}
+
+.info-card {
+  padding: 1rem;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.76);
+  border: 1px solid rgba(24, 50, 42, 0.12);
+}
+
+.info-card.accent-card {
+  background: linear-gradient(135deg, rgba(31, 106, 87, 0.15), rgba(221, 141, 60, 0.16));
+}
+
+.info-value {
+  margin: 0;
+  font-family: "Space Grotesk", "Segoe UI", sans-serif;
+  font-size: 1.35rem;
+  line-height: 1.1;
+  overflow-wrap: anywhere;
+}
+
+.info-value.small {
+  font-size: 1rem;
+  line-height: 1.45;
+}
+
+.generator-note {
+  margin-bottom: 1rem;
+  padding: 1rem;
+  border-radius: 18px;
+  background: rgba(217, 237, 230, 0.52);
+  border: 1px solid rgba(31, 106, 87, 0.12);
+  color: var(--muted);
+  line-height: 1.6;
+}
+
 .domain-toolbar {
   display: flex;
   justify-content: space-between;
@@ -307,6 +348,12 @@ h2 {
   margin-top: 1rem;
 }
 
+.result-subtext {
+  margin: 0.7rem 0 0;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
 .status-message {
   margin: 0;
 }
@@ -359,6 +406,10 @@ h2 {
   .panel-head,
   .domain-toolbar {
     flex-direction: column;
+  }
+
+  .info-grid {
+    grid-template-columns: 1fr;
   }
 
   .result-email {

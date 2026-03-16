@@ -1,17 +1,161 @@
 const GUERRILLA_API_URL = "https://api.guerrillamail.com/ajax.php";
 const SESSION_COOKIE = "TEMPMGEN_GMSESSID";
-const SUPPORTED_DOMAINS = [
-  "sharklasers.com",
-  "guerrillamail.info",
-  "grr.la",
-  "guerrillamail.biz",
-  "guerrillamail.com",
-  "guerrillamail.de",
-  "guerrillamail.net",
-  "guerrillamail.org",
-  "guerrillamailblock.com",
-  "pokemail.net",
-  "spam4.me",
+const FIXED_DOMAIN = "pokemail.net";
+const PEOPLE = [
+  "andi",
+  "budi",
+  "cahya",
+  "dewi",
+  "eka",
+  "fajar",
+  "gani",
+  "hani",
+  "indra",
+  "joko",
+  "kiki",
+  "lina",
+  "mega",
+  "nanda",
+  "okta",
+  "putra",
+  "qori",
+  "rani",
+  "sandi",
+  "tari",
+  "ulfa",
+  "vino",
+  "wati",
+  "yoga",
+  "zaki",
+  "agus",
+  "bella",
+  "citra",
+  "dimas",
+  "elsa",
+  "farah",
+  "galih",
+  "hanif",
+  "irma",
+  "jihan",
+  "kevin",
+  "lutfi",
+  "mira",
+  "nina",
+  "ovi",
+  "prima",
+  "rahma",
+  "salsa",
+  "tiara",
+  "umar",
+  "vidi",
+  "wahyu",
+  "yuni",
+  "zahra",
+  "rio",
+];
+const OBJECTS = [
+  "paku",
+  "meja",
+  "kursi",
+  "lampu",
+  "buku",
+  "pena",
+  "gelas",
+  "sendok",
+  "garpu",
+  "payung",
+  "tas",
+  "sepatu",
+  "bantal",
+  "guling",
+  "lemari",
+  "kunci",
+  "roda",
+  "mesin",
+  "kipas",
+  "botol",
+  "cermin",
+  "radio",
+  "kabel",
+  "piring",
+  "pisau",
+  "helm",
+  "sabun",
+  "ember",
+  "jarum",
+  "kertas",
+  "sarung",
+  "selimut",
+  "karpet",
+  "rantai",
+  "gembok",
+  "sapu",
+  "penggaris",
+  "kompor",
+  "wajan",
+  "mangkok",
+  "topi",
+  "jaket",
+  "kaos",
+  "celana",
+  "koper",
+  "baskom",
+  "obeng",
+  "palu",
+  "spidol",
+  "terminal",
+];
+const CITIES = [
+  "jakarta",
+  "bandung",
+  "bogor",
+  "depok",
+  "bekasi",
+  "tangerang",
+  "cirebon",
+  "serang",
+  "semarang",
+  "solo",
+  "salatiga",
+  "yogyakarta",
+  "magelang",
+  "tegal",
+  "purwokerto",
+  "surabaya",
+  "madiun",
+  "kediri",
+  "blitar",
+  "malang",
+  "probolinggo",
+  "pasuruan",
+  "mojokerto",
+  "banyuwangi",
+  "denpasar",
+  "mataram",
+  "kupang",
+  "pontianak",
+  "singkawang",
+  "palangkaraya",
+  "banjarmasin",
+  "samarinda",
+  "balikpapan",
+  "tarakan",
+  "manado",
+  "gorontalo",
+  "palu",
+  "makassar",
+  "parepare",
+  "kendari",
+  "baubau",
+  "ambon",
+  "ternate",
+  "jayapura",
+  "sorong",
+  "merauke",
+  "padang",
+  "pekanbaru",
+  "jambi",
+  "palembang",
 ];
 
 export default {
@@ -24,7 +168,9 @@ export default {
           ok: true,
           service: "TempMGen",
           provider: "Guerrilla Mail",
-          requiresSecret: false,
+          fixedDomain: FIXED_DOMAIN,
+          generator: getGeneratorInfo(),
+          hasTelegramToken: Boolean(env.TELEGRAM_BOT_TOKEN),
         },
         200,
       );
@@ -35,9 +181,11 @@ export default {
         {
           ok: true,
           provider: "Guerrilla Mail",
-          mode: "static-list",
-          note: "Semua domain Guerrilla Mail mengarah ke inbox session yang sama.",
-          domains: [...SUPPORTED_DOMAINS],
+          locked: true,
+          fixedDomain: FIXED_DOMAIN,
+          domains: [FIXED_DOMAIN],
+          generator: getGeneratorInfo(),
+          note: "Domain dikunci ke @pokemail.net. Nama email dibuat otomatis di Worker.",
         },
         200,
       );
@@ -60,27 +208,9 @@ export default {
 };
 
 async function handleCreate(request) {
-  let body;
-
-  try {
-    body = await request.json();
-  } catch {
-    return json({ ok: false, error: "Request body must be valid JSON." }, 400);
-  }
-
-  const username = normalizeUsername(body?.username);
-  const domain = normalizeDomain(body?.domain);
-
-  if (!domain) {
-    return json({ ok: false, error: "Domain is required." }, 400);
-  }
-
-  if (!SUPPORTED_DOMAINS.includes(domain)) {
-    return json({ ok: false, error: "Domain is not supported by Guerrilla Mail." }, 400);
-  }
-
   const client = getClientDetails(request);
   const storedSessionId = getCookie(request.headers.get("cookie"), SESSION_COOKIE);
+  const generated = generateIdentity();
 
   const initResponse = await callGuerrilla(
     {
@@ -100,7 +230,7 @@ async function handleCreate(request) {
   const setResponse = await callGuerrilla(
     {
       f: "set_email_user",
-      email_user: username,
+      email_user: generated.username,
       ip: client.ip,
       agent: client.agent,
       lang: "en",
@@ -114,17 +244,18 @@ async function handleCreate(request) {
 
   const sessionId = setResponse.sessionId || activeSessionId;
   const actualEmail = String(setResponse.data?.email_addr || "").trim();
-  const email = `${username}@${domain}`;
-
+  const email = `${generated.username}@${FIXED_DOMAIN}`;
   const response = json(
     {
       ok: true,
       provider: "Guerrilla Mail",
       email,
       actualEmail,
-      username,
-      domain,
-      note: "Domain Guerrilla yang berbeda tetap masuk ke inbox session yang sama.",
+      username: generated.username,
+      domain: FIXED_DOMAIN,
+      parts: generated.parts,
+      generator: getGeneratorInfo(),
+      note: "Email dibuat otomatis dengan pola nama + benda + kota + angka 0-99 di domain @pokemail.net.",
     },
     200,
   );
@@ -194,6 +325,37 @@ async function callGuerrilla(params, sessionId) {
   }
 }
 
+function generateIdentity() {
+  const parts = {
+    person: pick(PEOPLE),
+    object: pick(OBJECTS),
+    city: pick(CITIES),
+    number: String(randomInt(100)),
+  };
+  const username = normalizeLocalPart(`${parts.person}${parts.object}${parts.city}${parts.number}`);
+
+  return { username, parts };
+}
+
+function getGeneratorInfo() {
+  return {
+    pattern: "nama + benda + kota + angka 0-99",
+    peopleCount: PEOPLE.length,
+    objectCount: OBJECTS.length,
+    cityCount: CITIES.length,
+  };
+}
+
+function pick(list) {
+  return list[randomInt(list.length)];
+}
+
+function randomInt(max) {
+  const array = new Uint32Array(1);
+  crypto.getRandomValues(array);
+  return array[0] % max;
+}
+
 function getClientDetails(request) {
   const forwarded = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for");
   const ip = String(forwarded || "127.0.0.1").split(",")[0].trim() || "127.0.0.1";
@@ -228,30 +390,14 @@ function serializeCookie(name, value) {
   return `${name}=${value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=3600`;
 }
 
-function normalizeUsername(value) {
-  const cleaned = String(value ?? "tempmgen")
+function normalizeLocalPart(value) {
+  const cleaned = String(value)
     .trim()
     .toLowerCase()
-    .replace(/\s+/g, "-")
-    .replace(/[^a-z0-9._+-]/g, "")
-    .replace(/[-_.+]{2,}/g, "-")
-    .replace(/^[-_.+]+|[-_.+]+$/g, "")
+    .replace(/[^a-z0-9]/g, "")
     .slice(0, 40);
 
-  return cleaned || "tempmgen";
-}
-
-function normalizeDomain(value) {
-  const cleaned = String(value ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/^@+/, "");
-
-  if (!/^[a-z0-9.-]+$/.test(cleaned)) {
-    return "";
-  }
-
-  return cleaned;
+  return cleaned || "tempmgen0";
 }
 
 function json(payload, status) {

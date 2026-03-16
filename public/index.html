@@ -6,7 +6,7 @@
     <title>TempMGen</title>
     <meta
       name="description"
-      content="TempMGen web app for browsing Guerrilla Mail domains and generating temp email addresses through a Cloudflare Worker."
+      content="TempMGen web app for generating random pokemail.net addresses through a Cloudflare Worker and Guerrilla Mail session." 
     />
     <link rel="stylesheet" href="/styles.css" />
   </head>
@@ -17,15 +17,15 @@
           <p class="eyebrow">Temporary Email Generator</p>
           <h1>TempMGen</h1>
           <p class="lead">
-            Web app sederhana untuk pilih domain Guerrilla Mail, filter cepat, lalu generate
-            email disposable lewat Cloudflare Worker.
+            Web app sederhana untuk generate email acak dengan skema nama orang + benda + kota
+            Indonesia + angka 0-99 di domain tetap <code>@pokemail.net</code>.
           </p>
         </div>
         <div class="hero-note">
           <span class="note-chip">Cloudflare-ready</span>
           <p>
-            Sekarang tidak pakai Sonjj/SmailPro. Domain list dan create email diarahkan lewat
-            endpoint internal Worker:
+            App ini memakai session Guerrilla Mail, tapi domain output dikunci ke
+            <code>@pokemail.net</code>. Semua generate diarahkan lewat endpoint internal Worker:
             <code>/api/domains</code> dan <code>/api/create</code>.
           </p>
         </div>
@@ -36,52 +36,32 @@
           <div class="panel-head">
             <div>
               <p class="panel-kicker">Generate</p>
-              <h2>Build alamat email</h2>
+              <h2>Auto generator</h2>
             </div>
-            <button id="reloadDomainsButton" class="ghost-button" type="button">
-              Reload domain
+            <button id="reloadButton" class="ghost-button" type="button">
+              Reload config
             </button>
           </div>
 
-          <div class="field-group">
-            <label for="usernameInput">Nama account</label>
-            <input
-              id="usernameInput"
-              name="username"
-              type="text"
-              maxlength="40"
-              autocomplete="off"
-              placeholder="tempmgen"
-            />
-            <p class="field-hint">
-              Nilai awal bisa diedit. Worker akan membersihkan karakter yang tidak cocok untuk
-              inbox ID Guerrilla.
-            </p>
+          <div class="info-grid">
+            <article class="info-card accent-card">
+              <p class="toolbar-label">Domain tetap</p>
+              <p id="domainValue" class="info-value">@pokemail.net</p>
+            </article>
+            <article class="info-card">
+              <p class="toolbar-label">Pola nama</p>
+              <p id="schemeValue" class="info-value small">nama + benda + kota + angka 0-99</p>
+            </article>
+            <article class="info-card">
+              <p class="toolbar-label">Pool kata</p>
+              <p id="poolValue" class="info-value small">50 nama, 50 benda, 50 kota</p>
+            </article>
           </div>
 
-          <div class="field-group">
-            <label for="domainSearchInput">Cari domain</label>
-            <input
-              id="domainSearchInput"
-              name="search"
-              type="search"
-              autocomplete="off"
-              placeholder="contoh: edu, gmail, outlook"
-            />
+          <div class="generator-note">
+            Setiap klik akan membuat alamat baru seperti
+            <code>andipakukediri99@pokemail.net</code> langsung dari Worker.
           </div>
-
-          <div class="domain-toolbar">
-            <div>
-              <p class="toolbar-label">Sumber domain</p>
-              <p id="domainSourceLabel" class="toolbar-value">Memuat...</p>
-            </div>
-            <div>
-              <p class="toolbar-label">Tersedia</p>
-              <p id="domainCountLabel" class="toolbar-value">0 domain</p>
-            </div>
-          </div>
-
-          <div id="domainList" class="domain-list" aria-live="polite"></div>
 
           <button id="generateButton" class="primary-button" type="button">
             Generate email
@@ -99,6 +79,9 @@
           <div class="result-card">
             <p class="result-label">Alamat email</p>
             <p id="generatedEmail" class="result-email">Belum ada email</p>
+            <p id="actualEmail" class="result-subtext">
+              Inbox Guerrilla asli akan muncul setelah generate.
+            </p>
             <div class="result-actions">
               <button id="copyButton" class="ghost-button" type="button" disabled>
                 Copy
@@ -109,16 +92,23 @@
           <div class="status-card">
             <p class="result-label">Pesan sistem</p>
             <p id="statusMessage" class="status-message neutral">
-              Domain akan dimuat otomatis saat halaman dibuka.
+              Konfigurasi generator akan dimuat otomatis saat halaman dibuka.
+            </p>
+          </div>
+
+          <div class="status-card">
+            <p class="result-label">Resep terakhir</p>
+            <p id="generatedRecipe" class="status-message neutral">
+              Bagian nama akan tampil di sini setelah generate.
             </p>
           </div>
 
           <div class="preview-card">
             <p class="preview-title">Flow saat ini</p>
             <ol>
-              <li>Worker mengembalikan daftar domain Guerrilla Mail yang didukung.</li>
-              <li>User pilih domain yang ingin dipakai.</li>
-              <li>Worker membuat inbox ID lalu menampilkan email sesuai domain yang dipilih.</li>
+              <li>Worker memilih 1 nama orang, 1 benda, 1 kota Indonesia, lalu angka 0-99.</li>
+              <li>Worker set inbox session Guerrilla dengan local-part hasil generator.</li>
+              <li>App menampilkan email final dengan domain tetap <code>@pokemail.net</code>.</li>
             </ol>
           </div>
         </section>
