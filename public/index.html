@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TempMGen</title>
+    <meta
+      name="description"
+      content="TempMGen web app for browsing Guerrilla Mail domains and generating temp email addresses through a Cloudflare Worker."
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Temporary Email Generator</p>
+          <h1>TempMGen</h1>
+          <p class="lead">
+            Web app sederhana untuk pilih domain Guerrilla Mail, filter cepat, lalu generate
+            email disposable lewat Cloudflare Worker.
+          </p>
+        </div>
+        <div class="hero-note">
+          <span class="note-chip">Cloudflare-ready</span>
+          <p>
+            Sekarang tidak pakai Sonjj/SmailPro. Domain list dan create email diarahkan lewat
+            endpoint internal Worker:
+            <code>/api/domains</code> dan <code>/api/create</code>.
+          </p>
+        </div>
+      </header>
+
+      <main class="app-grid">
+        <section class="panel controls-panel">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">Generate</p>
+              <h2>Build alamat email</h2>
+            </div>
+            <button id="reloadDomainsButton" class="ghost-button" type="button">
+              Reload domain
+            </button>
+          </div>
+
+          <div class="field-group">
+            <label for="usernameInput">Nama account</label>
+            <input
+              id="usernameInput"
+              name="username"
+              type="text"
+              maxlength="40"
+              autocomplete="off"
+              placeholder="tempmgen"
+            />
+            <p class="field-hint">
+              Nilai awal bisa diedit. Worker akan membersihkan karakter yang tidak cocok untuk
+              inbox ID Guerrilla.
+            </p>
+          </div>
+
+          <div class="field-group">
+            <label for="domainSearchInput">Cari domain</label>
+            <input
+              id="domainSearchInput"
+              name="search"
+              type="search"
+              autocomplete="off"
+              placeholder="contoh: edu, gmail, outlook"
+            />
+          </div>
+
+          <div class="domain-toolbar">
+            <div>
+              <p class="toolbar-label">Sumber domain</p>
+              <p id="domainSourceLabel" class="toolbar-value">Memuat...</p>
+            </div>
+            <div>
+              <p class="toolbar-label">Tersedia</p>
+              <p id="domainCountLabel" class="toolbar-value">0 domain</p>
+            </div>
+          </div>
+
+          <div id="domainList" class="domain-list" aria-live="polite"></div>
+
+          <button id="generateButton" class="primary-button" type="button">
+            Generate email
+          </button>
+        </section>
+
+        <section class="panel result-panel">
+          <div class="panel-head compact">
+            <div>
+              <p class="panel-kicker">Result</p>
+              <h2>Email siap dipakai</h2>
+            </div>
+          </div>
+
+          <div class="result-card">
+            <p class="result-label">Alamat email</p>
+            <p id="generatedEmail" class="result-email">Belum ada email</p>
+            <div class="result-actions">
+              <button id="copyButton" class="ghost-button" type="button" disabled>
+                Copy
+              </button>
+            </div>
+          </div>
+
+          <div class="status-card">
+            <p class="result-label">Pesan sistem</p>
+            <p id="statusMessage" class="status-message neutral">
+              Domain akan dimuat otomatis saat halaman dibuka.
+            </p>
+          </div>
+
+          <div class="preview-card">
+            <p class="preview-title">Flow saat ini</p>
+            <ol>
+              <li>Worker mengembalikan daftar domain Guerrilla Mail yang didukung.</li>
+              <li>User pilih domain yang ingin dipakai.</li>
+              <li>Worker membuat inbox ID lalu menampilkan email sesuai domain yang dipilih.</li>
+            </ol>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+  </html>

@@ -1,0 +1,265 @@
+const GUERRILLA_API_URL = "https://api.guerrillamail.com/ajax.php";
+const SESSION_COOKIE = "TEMPMGEN_GMSESSID";
+const SUPPORTED_DOMAINS = [
+  "sharklasers.com",
+  "guerrillamail.info",
+  "grr.la",
+  "guerrillamail.biz",
+  "guerrillamail.com",
+  "guerrillamail.de",
+  "guerrillamail.net",
+  "guerrillamail.org",
+  "guerrillamailblock.com",
+  "pokemail.net",
+  "spam4.me",
+];
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/api/health") {
+      return json(
+        {
+          ok: true,
+          service: "TempMGen",
+          provider: "Guerrilla Mail",
+          requiresSecret: false,
+        },
+        200,
+      );
+    }
+
+    if (url.pathname === "/api/domains" && request.method === "GET") {
+      return json(
+        {
+          ok: true,
+          provider: "Guerrilla Mail",
+          mode: "static-list",
+          note: "Semua domain Guerrilla Mail mengarah ke inbox session yang sama.",
+          domains: [...SUPPORTED_DOMAINS],
+        },
+        200,
+      );
+    }
+
+    if (url.pathname === "/api/create" && request.method === "POST") {
+      return handleCreate(request);
+    }
+
+    if (url.pathname.startsWith("/api/")) {
+      return json({ ok: false, error: "Route not found" }, 404);
+    }
+
+    if (env.ASSETS) {
+      return env.ASSETS.fetch(request);
+    }
+
+    return new Response("Static assets binding not configured.", { status: 500 });
+  },
+};
+
+async function handleCreate(request) {
+  let body;
+
+  try {
+    body = await request.json();
+  } catch {
+    return json({ ok: false, error: "Request body must be valid JSON." }, 400);
+  }
+
+  const username = normalizeUsername(body?.username);
+  const domain = normalizeDomain(body?.domain);
+
+  if (!domain) {
+    return json({ ok: false, error: "Domain is required." }, 400);
+  }
+
+  if (!SUPPORTED_DOMAINS.includes(domain)) {
+    return json({ ok: false, error: "Domain is not supported by Guerrilla Mail." }, 400);
+  }
+
+  const client = getClientDetails(request);
+  const storedSessionId = getCookie(request.headers.get("cookie"), SESSION_COOKIE);
+
+  const initResponse = await callGuerrilla(
+    {
+      f: "get_email_address",
+      ip: client.ip,
+      agent: client.agent,
+      lang: "en",
+    },
+    storedSessionId,
+  );
+
+  if (!initResponse.ok) {
+    return json({ ok: false, error: initResponse.error }, 502);
+  }
+
+  const activeSessionId = initResponse.sessionId || storedSessionId;
+  const setResponse = await callGuerrilla(
+    {
+      f: "set_email_user",
+      email_user: username,
+      ip: client.ip,
+      agent: client.agent,
+      lang: "en",
+    },
+    activeSessionId,
+  );
+
+  if (!setResponse.ok) {
+    return json({ ok: false, error: setResponse.error }, 502);
+  }
+
+  const sessionId = setResponse.sessionId || activeSessionId;
+  const actualEmail = String(setResponse.data?.email_addr || "").trim();
+  const email = `${username}@${domain}`;
+
+  const response = json(
+    {
+      ok: true,
+      provider: "Guerrilla Mail",
+      email,
+      actualEmail,
+      username,
+      domain,
+      note: "Domain Guerrilla yang berbeda tetap masuk ke inbox session yang sama.",
+    },
+    200,
+  );
+
+  if (sessionId) {
+    response.headers.append("set-cookie", serializeCookie(SESSION_COOKIE, sessionId));
+  }
+
+  return response;
+}
+
+async function callGuerrilla(params, sessionId) {
+  const query = new URLSearchParams();
+
+  for (const [key, value] of Object.entries(params)) {
+    query.set(key, String(value));
+  }
+
+  const headers = {
+    Accept: "application/json",
+  };
+
+  if (sessionId) {
+    headers.Cookie = `PHPSESSID=${sessionId}`;
+  }
+
+  try {
+    const response = await fetch(`${GUERRILLA_API_URL}?${query.toString()}`, {
+      method: "GET",
+      headers,
+    });
+    const raw = await response.text();
+    const setCookie = response.headers.get("set-cookie") || "";
+    const nextSessionId = extractSetCookie(setCookie, "PHPSESSID") || sessionId;
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: raw || `Guerrilla request failed with status ${response.status}`,
+        sessionId: nextSessionId,
+      };
+    }
+
+    let data;
+
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      return {
+        ok: false,
+        error: "Guerrilla returned invalid JSON.",
+        sessionId: nextSessionId,
+      };
+    }
+
+    return {
+      ok: true,
+      data,
+      sessionId: nextSessionId,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "Unknown upstream error",
+      sessionId,
+    };
+  }
+}
+
+function getClientDetails(request) {
+  const forwarded = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for");
+  const ip = String(forwarded || "127.0.0.1").split(",")[0].trim() || "127.0.0.1";
+  const agent = (request.headers.get("user-agent") || "TempMGen").slice(0, 160);
+
+  return { ip, agent };
+}
+
+function getCookie(cookieHeader, name) {
+  if (!cookieHeader) {
+    return "";
+  }
+
+  const target = `${name}=`;
+
+  for (const part of cookieHeader.split(";")) {
+    const trimmed = part.trim();
+    if (trimmed.startsWith(target)) {
+      return trimmed.slice(target.length);
+    }
+  }
+
+  return "";
+}
+
+function extractSetCookie(headerValue, name) {
+  const match = headerValue.match(new RegExp(`(?:^|,\\s*)${name}=([^;,\\s]+)`));
+  return match?.[1] || "";
+}
+
+function serializeCookie(name, value) {
+  return `${name}=${value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=3600`;
+}
+
+function normalizeUsername(value) {
+  const cleaned = String(value ?? "tempmgen")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9._+-]/g, "")
+    .replace(/[-_.+]{2,}/g, "-")
+    .replace(/^[-_.+]+|[-_.+]+$/g, "")
+    .slice(0, 40);
+
+  return cleaned || "tempmgen";
+}
+
+function normalizeDomain(value) {
+  const cleaned = String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/^@+/, "");
+
+  if (!/^[a-z0-9.-]+$/.test(cleaned)) {
+    return "";
+  }
+
+  return cleaned;
+}
+
+function json(payload, status) {
+  return new Response(JSON.stringify(payload, null, 2), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    },
+  });
+}
