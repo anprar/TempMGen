@@ -1151,6 +1151,10 @@ function extractHydraMembers(data) {
     return [];
   }
 
+  if (Array.isArray(data)) {
+    return data;
+  }
+
   if (Array.isArray(data["hydra:member"])) {
     return data["hydra:member"];
   }
