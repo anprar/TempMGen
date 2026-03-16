@@ -8,7 +8,7 @@ Web app sederhana untuk:
 - terima update Telegram lewat webhook Worker
 - sediakan command bot `/start`, `/new`, `/history`, `/delete`, `/note`, `/inbox`, `/refresh`, dan `/import`
 - simpan history email Telegram dengan batas default 5, premium 25, dan admin unlimited
-- tampilkan saran password, VCC dummy, dan OTP yang terdeteksi saat perlu
+- tampilkan password inbox, VCC dummy, dan OTP yang terdeteksi saat perlu
 - sediakan buka isi email penuh, hapus pesan, dan admin tools dasar
 
 ## Stack
@@ -55,6 +55,7 @@ Command yang sudah aktif:
 - `TELEGRAM_BOT_TOKEN` wajib
 - `TELEGRAM_WEBHOOK_SECRET` opsional tapi direkomendasikan
 - `PREMIUM_CHAT_IDS` opsional untuk menandai chat premium agar limit history naik ke 25
+- `INBOX_PASSWORD_SECRET` direkomendasikan untuk membuat password inbox bot yang stabil dan bisa direcovery
 
 ### Set webhook Telegram
 
@@ -85,7 +86,8 @@ curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<w
 - `/note email@domain.tld catatan` menambah catatan untuk email tertentu
 - `/inbox email@domain.tld` membuka inbox email itu
 - `/refresh email@domain.tld` mengambil inbox terbaru untuk email itu
-- `/import email@domain.tld password` memulihkan email lama atau email dari luar bot selama domain masih didukung
+- `/import email@domain.tld` memulihkan email buatan bot
+- `/import email@domain.tld password-bot` memulihkan email buatan bot dengan Password inbox
 - tombol inline untuk `Inbox`, `Refresh`, `Open`, `Delete Message`, `History`, `Import`, `Catatan`, dan `Pembelian 5k/bulan`
 
 ### History email
@@ -96,7 +98,10 @@ curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<w
 - saat history penuh, bot menolak generate/import email baru dan menampilkan pesan error
 - tombol `Pembelian 5k/bulan` langsung diarahkan ke `https://t.me/AndiPradanaAr`
 - setiap email history bisa punya catatan sendiri
-- untuk email luar bot, password akun harus ikut disertakan saat import pertama kali
+- password inbox untuk email buatan bot dibuat deterministik dari `email + secret`
+- jadi email buatan bot bisa direcovery lagi walau history sempat terhapus
+- email luar bot tidak didukung untuk import ke bot ini
+- paket Pro aktif 30 hari, H-7 bot kirim reminder, dan saat habis history dipruning ke 5
 
 Cloudflare Durable Object dipakai untuk menyimpan history email per chat.
 
@@ -155,6 +160,12 @@ Chat premium opsional:
 
 ```bash
 npx wrangler secret put PREMIUM_CHAT_IDS
+```
+
+Secret password inbox opsional tapi direkomendasikan:
+
+```bash
+npx wrangler secret put INBOX_PASSWORD_SECRET
 ```
 
 Isi `PREMIUM_CHAT_IDS` dengan daftar chat ID premium dipisah koma atau baris baru.

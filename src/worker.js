@@ -2,12 +2,17 @@ const MAIL_TM_API_URL = "https://api.mail.tm";
 const DEFAULT_HISTORY_LIMIT = 5;
 const PREMIUM_HISTORY_LIMIT = 25;
 const PREMIUM_HISTORY_PRICE_LABEL = "5k/bulan";
+const PRO_PLAN_DURATION_DAYS = 30;
+const PRO_REMINDER_LEAD_DAYS = 7;
 const ADMIN_TELEGRAM_USERNAME = "AndiPradanaAr";
 const ADMIN_TELEGRAM_URL = "https://t.me/AndiPradanaAr";
+const DEFAULT_INBOX_PASSWORD_SECRET = "tempmgen-mailtm-secret-v1";
 const HISTORY_PREVIEW_LIMIT = 25;
 const HISTORY_NOTE_MAX_LENGTH = 300;
 const FALLBACK_HISTORY_STORE = new Map();
 const FALLBACK_PENDING_STORE = new Map();
+const FALLBACK_SUBSCRIPTION_STORE = new Map();
+const FALLBACK_SUBSCRIPTION_REGISTRY = new Map();
 const DOMAIN_EXAMPLE_FALLBACK = "email@domain.tld";
 const PASSWORD_ANIMALS = [
   "Gajah",
@@ -288,10 +293,14 @@ export default {
 
     return new Response("Static assets binding not configured.", { status: 500 });
   },
+
+  async scheduled(_controller, env, ctx) {
+    ctx.waitUntil(runSubscriptionMaintenance(env));
+  },
 };
 
 async function handleCreate(request) {
-  const result = await generateMailbox(request);
+  const result = await generateMailbox(env);
 
   if (!result.ok) {
     return json({ ok: false, error: result.error }, 502);
@@ -351,7 +360,7 @@ async function handleTelegramWebhook(request, env) {
   const parsedCommand = parseTelegramCommand(text);
   const command = parsedCommand.command;
   const actorUsername = getTelegramActorUsername(message);
-  const plan = getChatPlan(env, chatId, actorUsername);
+  const plan = await resolveChatPlan(env, chatId, actorUsername);
   const pendingAction = await getPendingAction(env, chatId);
 
   if (!chatId) {
@@ -398,6 +407,62 @@ async function handleTelegramWebhook(request, env) {
     });
 
     return json({ ok: true, handled: true, command }, 200);
+  }
+
+  if (command === "listpro" && plan.isAdmin) {
+    const historyState = await getHistoryState(env, chatId, plan);
+    const subscriptions = await listChatSubscriptions(env);
+
+    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildProListMessage(subscriptions), {
+      parse_mode: "HTML",
+      reply_markup: buildAdminKeyboard(historyState),
+    });
+
+    return json({ ok: true, handled: true, command }, 200);
+  }
+
+  if ((command === "setpro" || command === "unpro") && plan.isAdmin) {
+    const targetChatId = parseChatIdInput(parsedCommand.argsText);
+
+    if (!targetChatId) {
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildAdminChatIdPrompt(command === "setpro" ? "admin_setpro" : "admin_removepro", "Chat ID tidak valid."), {
+        parse_mode: "HTML",
+        reply_markup: buildAdminKeyboard(await getHistoryState(env, chatId, plan)),
+      });
+
+      return json({ ok: true, handled: true, command, error: "Chat ID tidak valid." }, 200);
+    }
+
+    if (command === "setpro") {
+      const subscription = await setChatProSubscription(env, targetChatId, { source: "admin" });
+      const targetPlan = await resolveChatPlan(env, targetChatId, "");
+
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, Number(targetChatId), buildSubscriptionActivatedMessage(subscription), {
+        parse_mode: "HTML",
+        reply_markup: buildHomeKeyboard(targetPlan),
+      }).catch(() => null);
+
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildAdminSubscriptionResultMessage(targetChatId, subscription), {
+        parse_mode: "HTML",
+        reply_markup: buildAdminKeyboard(await getHistoryState(env, chatId, plan)),
+      });
+
+      return json({ ok: true, handled: true, command, chatId: targetChatId }, 200);
+    }
+
+    await clearChatSubscription(env, targetChatId);
+    await pruneHistoryToLimit(env, targetChatId, DEFAULT_HISTORY_LIMIT);
+
+    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, Number(targetChatId), buildSubscriptionRemovedMessage(), {
+      parse_mode: "HTML",
+    }).catch(() => null);
+
+    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildAdminSubscriptionRemovedResult(targetChatId), {
+      parse_mode: "HTML",
+      reply_markup: buildAdminKeyboard(await getHistoryState(env, chatId, plan)),
+    });
+
+    return json({ ok: true, handled: true, command, chatId: targetChatId }, 200);
   }
 
   if (command === "history") {
@@ -503,7 +568,7 @@ async function handleTelegramWebhook(request, env) {
       return json({ ok: true, handled: true, command, error: "History limit reached" }, 200);
     }
 
-    const result = await generateMailbox(request);
+    const result = await generateMailbox(env);
 
     if (!result.ok) {
       await sendTelegramMessage(
@@ -537,7 +602,8 @@ async function handleTelegramWebhook(request, env) {
 
   if (command === "import") {
     const historyState = await getHistoryState(env, chatId, plan);
-    const importInput = resolveImportInput(parsedCommand.argsText, historyState);
+    const rawImportInput = resolveImportInput(parsedCommand.argsText, historyState);
+    const importInput = await resolveImportAccess(env, rawImportInput);
 
     if (!importInput.ok) {
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildImportUsageMessage(importInput.error), {
@@ -560,6 +626,9 @@ async function handleTelegramWebhook(request, env) {
       displayEmail: importInput.email,
       mailboxPassword: importInput.password,
       historyEntry: importInput.historyEntry,
+      passwordSource: importInput.passwordSource,
+      allowDeterministicPassword: importInput.allowDeterministicPassword,
+      env,
     });
 
     if (!inboxResult.ok) {
@@ -649,7 +718,7 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
   const chatId = callbackQuery?.message?.chat?.id;
   const data = String(callbackQuery?.data ?? "");
   const actorUsername = getTelegramActorUsername(callbackQuery);
-  const plan = getChatPlan(env, chatId, actorUsername);
+  const plan = await resolveChatPlan(env, chatId, actorUsername);
 
   if (!callbackId || !chatId || !data) {
     return json({ ok: true, ignored: true }, 200);
@@ -669,7 +738,7 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
         return json({ ok: true, handled: true, callback: data, error: "History limit reached" }, 200);
       }
 
-      const result = await generateMailbox(request);
+      const result = await generateMailbox(env);
 
       if (!result.ok) {
         await answerTelegramCallbackQuery(
@@ -739,6 +808,45 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
 
       await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Stats dikirim.");
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildStatsMessage(stats), {
+        parse_mode: "HTML",
+        reply_markup: buildAdminKeyboard(historyState),
+      });
+
+      return json({ ok: true, handled: true, callback: data }, 200);
+    }
+
+    if (data === "admin_listpro" && plan.isAdmin) {
+      const historyState = await getHistoryState(env, chatId, plan);
+      const subscriptions = await listChatSubscriptions(env);
+
+      await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Daftar Pro dikirim.");
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildProListMessage(subscriptions), {
+        parse_mode: "HTML",
+        reply_markup: buildAdminKeyboard(historyState),
+      });
+
+      return json({ ok: true, handled: true, callback: data }, 200);
+    }
+
+    if (data === "admin_setpro" && plan.isAdmin) {
+      const historyState = await getHistoryState(env, chatId, plan);
+
+      await setPendingAction(env, chatId, { type: "admin_setpro" });
+      await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Kirim Chat ID user.");
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildAdminChatIdPrompt("admin_setpro"), {
+        parse_mode: "HTML",
+        reply_markup: buildAdminKeyboard(historyState),
+      });
+
+      return json({ ok: true, handled: true, callback: data }, 200);
+    }
+
+    if (data === "admin_removepro" && plan.isAdmin) {
+      const historyState = await getHistoryState(env, chatId, plan);
+
+      await setPendingAction(env, chatId, { type: "admin_removepro" });
+      await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Kirim Chat ID user.");
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildAdminChatIdPrompt("admin_removepro"), {
         parse_mode: "HTML",
         reply_markup: buildAdminKeyboard(historyState),
       });
@@ -998,7 +1106,8 @@ async function handlePendingTelegramInput(request, env, message, text, pendingAc
 
   if (pendingAction.type === "import") {
     const historyState = await getHistoryState(env, chatId, plan);
-    const importInput = resolveImportInput(text, historyState);
+    const rawImportInput = resolveImportInput(text, historyState);
+    const importInput = await resolveImportAccess(env, rawImportInput);
 
     if (!importInput.ok) {
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildImportUsageMessage(importInput.error), {
@@ -1021,6 +1130,9 @@ async function handlePendingTelegramInput(request, env, message, text, pendingAc
       displayEmail: importInput.email,
       mailboxPassword: importInput.password,
       historyEntry: importInput.historyEntry,
+      passwordSource: importInput.passwordSource,
+      allowDeterministicPassword: importInput.allowDeterministicPassword,
+      env,
     });
 
     if (!inboxResult.ok) {
@@ -1075,10 +1187,59 @@ async function handlePendingTelegramInput(request, env, message, text, pendingAc
     return json({ ok: true, handled: true, pending: pendingAction.type, email: pendingAction.email }, 200);
   }
 
+  if ((pendingAction.type === "admin_setpro" || pendingAction.type === "admin_removepro") && plan.isAdmin) {
+    const targetChatId = parseChatIdInput(text);
+
+    if (!targetChatId) {
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildAdminChatIdPrompt(pendingAction.type, "Chat ID tidak valid."), {
+        parse_mode: "HTML",
+        reply_markup: buildAdminKeyboard(await getHistoryState(env, chatId, plan)),
+      });
+
+      return json({ ok: true, handled: true, pending: pendingAction.type, error: "Chat ID tidak valid." }, 200);
+    }
+
+    if (pendingAction.type === "admin_setpro") {
+      const subscription = await setChatProSubscription(env, targetChatId, { source: "admin" });
+      const targetPlan = await resolveChatPlan(env, targetChatId, "");
+
+      await sendTelegramMessage(
+        env.TELEGRAM_BOT_TOKEN,
+        Number(targetChatId),
+        buildSubscriptionActivatedMessage(subscription),
+        { parse_mode: "HTML", reply_markup: buildHomeKeyboard(targetPlan) },
+      ).catch(() => null);
+
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildAdminSubscriptionResultMessage(targetChatId, subscription), {
+        parse_mode: "HTML",
+        reply_markup: buildAdminKeyboard(await getHistoryState(env, chatId, plan)),
+      });
+
+      return json({ ok: true, handled: true, pending: pendingAction.type, chatId: targetChatId }, 200);
+    }
+
+    await clearChatSubscription(env, targetChatId);
+    await pruneHistoryToLimit(env, targetChatId, DEFAULT_HISTORY_LIMIT);
+
+    await sendTelegramMessage(
+      env.TELEGRAM_BOT_TOKEN,
+      Number(targetChatId),
+      buildSubscriptionRemovedMessage(),
+      { parse_mode: "HTML" },
+    ).catch(() => null);
+
+    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildAdminSubscriptionRemovedResult(targetChatId), {
+      parse_mode: "HTML",
+      reply_markup: buildAdminKeyboard(await getHistoryState(env, chatId, plan)),
+    });
+
+    return json({ ok: true, handled: true, pending: pendingAction.type, chatId: targetChatId }, 200);
+  }
+
   return json({ ok: true, ignored: true }, 200);
 }
 
-async function generateMailbox() {
+async function generateMailbox(env) {
   const domainsResult = await fetchAvailableDomains();
 
   if (!domainsResult.ok || !domainsResult.domains.length) {
@@ -1086,13 +1247,13 @@ async function generateMailbox() {
   }
 
   const generated = generateIdentity();
-  const passwordSuggestion = generatePasswordSuggestion();
   const vcc = generateDummyVcc();
 
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const localPart = attempt === 0 ? generated.username : `${generated.username}${attempt}`.slice(0, 40);
     const domain = domainsResult.domains[attempt % domainsResult.domains.length];
     const email = `${localPart}@${domain}`;
+    const passwordSuggestion = await generateInboxPassword(email, env);
 
     const accountResult = await createMailTmAccount(email, passwordSuggestion);
 
@@ -1136,20 +1297,32 @@ async function generateMailbox() {
 async function getMailboxInbox(_request, localPart, options = {}) {
   const displayEmail = String(options.displayEmail || "").trim().toLowerCase();
   const historyEntry = options.historyEntry || null;
-  const password =
+  let password =
     String(options.mailboxPassword || historyEntry?.mailboxPassword || historyEntry?.passwordSuggestion || "").trim();
+  const passwordSource = String(options.passwordSource || "").trim().toLowerCase();
 
   if (!displayEmail) {
     return { ok: false, error: "Email target belum tersedia." };
   }
 
+  if (!password && options.allowDeterministicPassword) {
+    password = await generateInboxPassword(displayEmail, options.env);
+  }
+
   if (!password) {
-    return { ok: false, error: "Password email belum tersimpan. Import ulang email dengan password-nya." };
+    return { ok: false, error: "Password email belum tersimpan di history bot." };
   }
 
   const tokenResult = await createMailTmToken(displayEmail, password);
 
   if (!tokenResult.ok) {
+    if (passwordSource === "deterministic") {
+      return {
+        ok: false,
+        error: "Email ini bukan email bot yang dibuat di sini, atau Password inbox bot-nya berbeda.",
+      };
+    }
+
     return { ok: false, error: tokenResult.error };
   }
 
@@ -1271,7 +1444,7 @@ async function createMailTmToken(address, password) {
     if (result.status === 401) {
       return {
         ok: false,
-        error: "Email atau password salah. Untuk email luar bot, gunakan format: /import email@domain.tld password",
+        error: "Email atau Password inbox salah.",
       };
     }
 
@@ -1366,6 +1539,7 @@ async function deleteMailboxMessage(email, historyEntry, messageId) {
 
 async function getAdminStats(env, chatId, historyState) {
   const domainsResult = await fetchAvailableDomains();
+  const subscriptions = await listChatSubscriptions(env);
 
   return {
     provider: "mail.tm",
@@ -1373,6 +1547,7 @@ async function getAdminStats(env, chatId, historyState) {
     historyCount: historyState.count,
     planName: formatPlanName(historyState),
     premiumConfiguredCount: parsePremiumChatIds(env?.PREMIUM_CHAT_IDS).size,
+    activeProCount: subscriptions.length,
     chatId,
   };
 }
@@ -1436,8 +1611,16 @@ function padNumber(value, length = 2) {
   return String(value).padStart(length, "0");
 }
 
-function generatePasswordSuggestion() {
-  return `${pick(PASSWORD_ANIMALS)}${pick(PASSWORD_ACTIONS)}${pick(PASSWORD_FOODS)}${padNumber(randomInt(100))}`;
+async function generateInboxPassword(email, env) {
+  const seed = `${String(env?.INBOX_PASSWORD_SECRET || DEFAULT_INBOX_PASSWORD_SECRET)}:${String(email).trim().toLowerCase()}`;
+  const bytes = await digestSeed(seed);
+
+  return `${PASSWORD_ANIMALS[bytes[0] % PASSWORD_ANIMALS.length]}${PASSWORD_ACTIONS[bytes[1] % PASSWORD_ACTIONS.length]}${PASSWORD_FOODS[bytes[2] % PASSWORD_FOODS.length]}${padNumber(bytes[3] % 100)}`;
+}
+
+async function digestSeed(value) {
+  const buffer = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return new Uint8Array(buffer);
 }
 
 function generateDummyVcc() {
@@ -1518,10 +1701,140 @@ function getChatPlan(env, chatId, username = "") {
   return {
     isAdmin,
     isPremium,
+    planCode: isAdmin ? "admin" : isPremium ? "pro" : "basic",
     isUnlimited: isAdmin,
     limit: isAdmin ? null : isPremium ? PREMIUM_HISTORY_LIMIT : DEFAULT_HISTORY_LIMIT,
     upgradePriceLabel: PREMIUM_HISTORY_PRICE_LABEL,
+    expiresAt: 0,
+    isSubscriptionManaged: false,
   };
+}
+
+async function resolveChatPlan(env, chatId, username = "") {
+  const basePlan = getChatPlan(env, chatId, username);
+
+  if (basePlan.isAdmin || basePlan.isPremium) {
+    return basePlan;
+  }
+
+  const subscription = await getChatSubscription(env, chatId);
+
+  if (!subscription) {
+    return basePlan;
+  }
+
+  const now = Date.now();
+
+  if (subscription.expiresAt <= now) {
+    await clearChatSubscription(env, chatId);
+    await pruneHistoryToLimit(env, chatId, DEFAULT_HISTORY_LIMIT);
+    return basePlan;
+  }
+
+  return {
+    ...basePlan,
+    isPremium: true,
+    planCode: "pro",
+    limit: PREMIUM_HISTORY_LIMIT,
+    expiresAt: subscription.expiresAt,
+    isSubscriptionManaged: true,
+  };
+}
+
+async function getChatSubscription(env, chatId) {
+  const result = await invokeHistoryStore(env, chatId, "/subscription_get", {});
+  return normalizeSubscriptionRecord(result?.subscription, chatId);
+}
+
+async function setChatProSubscription(env, chatId, options = {}) {
+  const now = Date.now();
+  const current = await getChatSubscription(env, chatId);
+  const startFrom = current && current.expiresAt > now ? current.expiresAt : now;
+  const expiresAt = startFrom + PRO_PLAN_DURATION_DAYS * 24 * 60 * 60 * 1000;
+  const subscription = normalizeSubscriptionRecord(
+    {
+      chatId,
+      planCode: "pro",
+      expiresAt,
+      remindedAt: 0,
+      createdAt: current?.createdAt || now,
+      updatedAt: now,
+      source: options.source || "admin",
+    },
+    chatId,
+  );
+
+  await invokeHistoryStore(env, chatId, "/subscription_set", { subscription });
+  await invokeSubscriptionRegistry(env, "/subscription_upsert", { subscription });
+
+  return subscription;
+}
+
+async function clearChatSubscription(env, chatId) {
+  await invokeHistoryStore(env, chatId, "/subscription_clear", {});
+  await invokeSubscriptionRegistry(env, "/subscription_remove", { chatId: String(chatId) });
+}
+
+async function listChatSubscriptions(env) {
+  const result = await invokeSubscriptionRegistry(env, "/subscription_list", {});
+  return Array.isArray(result?.items)
+    ? result.items.map((item) => normalizeSubscriptionRecord(item, item?.chatId)).filter(Boolean)
+    : [];
+}
+
+async function updateChatSubscriptionReminder(env, subscription) {
+  if (!subscription) {
+    return;
+  }
+
+  await invokeHistoryStore(env, subscription.chatId, "/subscription_set", { subscription });
+  await invokeSubscriptionRegistry(env, "/subscription_upsert", { subscription });
+}
+
+async function pruneHistoryToLimit(env, chatId, limit) {
+  const result = await invokeHistoryStore(env, chatId, "/prune", { limit });
+  return Array.isArray(result?.items) ? result.items.length : 0;
+}
+
+async function runSubscriptionMaintenance(env) {
+  if (!env?.TELEGRAM_BOT_TOKEN) {
+    return;
+  }
+
+  const subscriptions = await listChatSubscriptions(env);
+  const now = Date.now();
+  const reminderWindowMs = PRO_REMINDER_LEAD_DAYS * 24 * 60 * 60 * 1000;
+
+  for (const subscription of subscriptions) {
+    if (!subscription) {
+      continue;
+    }
+
+    if (subscription.expiresAt <= now) {
+      await clearChatSubscription(env, subscription.chatId);
+      await pruneHistoryToLimit(env, subscription.chatId, DEFAULT_HISTORY_LIMIT);
+      await sendTelegramMessage(
+        env.TELEGRAM_BOT_TOKEN,
+        Number(subscription.chatId),
+        buildSubscriptionExpiredMessage(),
+        { parse_mode: "HTML" },
+      ).catch(() => null);
+      continue;
+    }
+
+    if (subscription.expiresAt - now <= reminderWindowMs && !subscription.remindedAt) {
+      await sendTelegramMessage(
+        env.TELEGRAM_BOT_TOKEN,
+        Number(subscription.chatId),
+        buildSubscriptionReminderMessage(subscription),
+        { parse_mode: "HTML" },
+      ).catch(() => null);
+
+      subscription.remindedAt = now;
+      subscription.updatedAt = now;
+      await updateChatSubscriptionReminder(env, subscription);
+    }
+  }
 }
 
 function parsePremiumChatIds(value) {
@@ -1544,7 +1857,14 @@ async function getHistoryState(env, chatId, plan = getChatPlan(env, chatId)) {
     isUnlimited: plan.isUnlimited,
   });
 
-  return normalizeHistoryState(result, plan);
+  let state = normalizeHistoryState(result, plan);
+
+  if (plan.limit !== null && state.count > plan.limit) {
+    const pruned = await invokeHistoryStore(env, chatId, "/prune", { limit: plan.limit });
+    state = normalizeHistoryState(pruned, plan);
+  }
+
+  return state;
 }
 
 async function recordHistoryEntry(env, chatId, payload, source, plan = getChatPlan(env, chatId)) {
@@ -1635,10 +1955,29 @@ async function invokeHistoryStore(env, chatId, path, payload) {
   return fallbackHistoryStoreFetch(chatId, path, payload);
 }
 
+async function invokeSubscriptionRegistry(env, path, payload) {
+  if (env?.TEMP_MGEN_STATE) {
+    const id = env.TEMP_MGEN_STATE.idFromName("registry:subscriptions");
+    const stub = env.TEMP_MGEN_STATE.get(id);
+    const response = await stub.fetch(`https://history${path}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    return response.json();
+  }
+
+  return fallbackSubscriptionRegistryFetch(path, payload);
+}
+
 function fallbackHistoryStoreFetch(chatId, path, payload) {
   const key = String(chatId ?? "unknown");
   const existing = normalizeStoredHistory(FALLBACK_HISTORY_STORE.get(key));
   const pending = normalizePendingAction(FALLBACK_PENDING_STORE.get(key));
+  const subscription = normalizeSubscriptionRecord(FALLBACK_SUBSCRIPTION_STORE.get(key), key);
 
   if (path === "/state") {
     return {
@@ -1675,6 +2014,48 @@ function fallbackHistoryStoreFetch(chatId, path, payload) {
     return {
       ok: true,
       pending: null,
+    };
+  }
+
+  if (path === "/subscription_get") {
+    return {
+      ok: true,
+      subscription,
+    };
+  }
+
+  if (path === "/subscription_set") {
+    const nextSubscription = normalizeSubscriptionRecord(payload?.subscription, key);
+
+    if (nextSubscription) {
+      FALLBACK_SUBSCRIPTION_STORE.set(key, nextSubscription);
+    } else {
+      FALLBACK_SUBSCRIPTION_STORE.delete(key);
+    }
+
+    return {
+      ok: true,
+      subscription: nextSubscription,
+    };
+  }
+
+  if (path === "/subscription_clear") {
+    FALLBACK_SUBSCRIPTION_STORE.delete(key);
+    return {
+      ok: true,
+      subscription: null,
+    };
+  }
+
+  if (path === "/prune") {
+    const limit = normalizeHistoryLimit(payload?.limit, {});
+    const nextItems = existing.slice(0, limit || existing.length);
+    FALLBACK_HISTORY_STORE.set(key, nextItems);
+
+    return {
+      ok: true,
+      items: nextItems,
+      count: nextItems.length,
     };
   }
 
@@ -1833,6 +2214,43 @@ function fallbackHistoryStoreFetch(chatId, path, payload) {
   };
 }
 
+function fallbackSubscriptionRegistryFetch(path, payload) {
+  if (path === "/subscription_list") {
+    return {
+      ok: true,
+      items: Array.from(FALLBACK_SUBSCRIPTION_REGISTRY.values()),
+    };
+  }
+
+  if (path === "/subscription_upsert") {
+    const subscription = normalizeSubscriptionRecord(payload?.subscription, payload?.subscription?.chatId);
+
+    if (subscription) {
+      FALLBACK_SUBSCRIPTION_REGISTRY.set(subscription.chatId, subscription);
+    }
+
+    return {
+      ok: true,
+      subscription,
+      items: Array.from(FALLBACK_SUBSCRIPTION_REGISTRY.values()),
+    };
+  }
+
+  if (path === "/subscription_remove") {
+    FALLBACK_SUBSCRIPTION_REGISTRY.delete(String(payload?.chatId ?? ""));
+    return {
+      ok: true,
+      items: Array.from(FALLBACK_SUBSCRIPTION_REGISTRY.values()),
+    };
+  }
+
+  return {
+    ok: false,
+    error: "Unknown registry operation.",
+    items: Array.from(FALLBACK_SUBSCRIPTION_REGISTRY.values()),
+  };
+}
+
 function normalizeHistoryState(result, plan) {
   const items = normalizeStoredHistory(result?.items);
 
@@ -1903,7 +2321,34 @@ function normalizePendingAction(value) {
     };
   }
 
+  if (type === "admin_setpro" || type === "admin_removepro") {
+    return { type };
+  }
+
   return null;
+}
+
+function normalizeSubscriptionRecord(value, fallbackChatId = "") {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const chatId = String(value.chatId ?? fallbackChatId ?? "").trim();
+  const expiresAt = Number(value.expiresAt || 0);
+
+  if (!chatId || !Number.isFinite(expiresAt) || expiresAt <= 0) {
+    return null;
+  }
+
+  return {
+    chatId,
+    planCode: String(value.planCode || "pro").trim().toLowerCase(),
+    expiresAt,
+    remindedAt: Number(value.remindedAt || 0),
+    createdAt: Number(value.createdAt || Date.now()),
+    updatedAt: Number(value.updatedAt || Date.now()),
+    source: String(value.source || "admin").trim().toLowerCase(),
+  };
 }
 
 function normalizeHistorySource(value, fallback = "generated") {
@@ -2067,7 +2512,8 @@ function buildStartMessage(historyState) {
     "Perintah:",
     "<code>/new</code> - buat email baru",
     "<code>/history</code> - lihat history email",
-    "<code>/import email password</code> - import email lama atau email luar",
+    "<code>/import email</code> - recovery email buatan bot",
+    "<code>/import email password-bot</code> - recovery pakai Password inbox",
     "<code>/delete email</code> - hapus 1 email dari history",
     "<code>/note email catatan</code> - simpan catatan email",
     "<code>/inbox email</code> - lihat inbox",
@@ -2090,7 +2536,7 @@ function buildNewEmailMessage(payload, historyState) {
     `Inbox: <code>${escapeHtml(payload.inboxStatus || "Kosong")}</code>`,
     `History: <code>${escapeHtml(formatHistoryUsage(historyState))}</code>`,
     "",
-    "Password saran:",
+    "Password inbox:",
     `<code>${escapeHtml(payload.passwordSuggestion)}</code>`,
     "",
     "VCC dummy:",
@@ -2100,7 +2546,7 @@ function buildNewEmailMessage(payload, historyState) {
   ];
 
   if (payload.otpCodes?.length) {
-    lines.push("", "OTP terdeteksi:");
+    lines.push("");
     for (const code of payload.otpCodes) {
       lines.push(`<code>${escapeHtml(code)}</code>`);
     }
@@ -2119,7 +2565,7 @@ function buildImportSuccessMessage(payload, historyState) {
   ];
 
   if (payload.passwordSuggestion) {
-    lines.push("", "Password:", `<code>${escapeHtml(payload.passwordSuggestion)}</code>`);
+    lines.push("", "Password inbox:", `<code>${escapeHtml(payload.passwordSuggestion)}</code>`);
   }
 
   if (payload.vcc?.number) {
@@ -2133,7 +2579,7 @@ function buildImportSuccessMessage(payload, historyState) {
   }
 
   if (payload.otpCodes?.length) {
-    lines.push("", "OTP terdeteksi:");
+    lines.push("");
     for (const code of payload.otpCodes) {
       lines.push(`<code>${escapeHtml(code)}</code>`);
     }
@@ -2173,7 +2619,8 @@ function buildHistoryMessage(historyState) {
 
   lines.push(
     "",
-    "Gunakan <code>/import email password</code> untuk recovery email tertentu.",
+    "Gunakan <code>/import email</code> untuk recovery email bot.",
+    "Gunakan <code>/import email password-bot</code> kalau mau pakai Password inbox bot.",
     "Gunakan <code>/delete email</code> untuk hapus history 1 email.",
     "Gunakan <code>/note email catatan</code> untuk menambah catatan.",
   );
@@ -2353,7 +2800,7 @@ function buildInboxMessage(payload, options = {}) {
   ];
 
   if (payload.passwordSuggestion) {
-    lines.push("", "Password saran:", `<code>${escapeHtml(payload.passwordSuggestion)}</code>`);
+    lines.push("", "Password inbox:", `<code>${escapeHtml(payload.passwordSuggestion)}</code>`);
   }
 
   if (payload.vcc?.number) {
@@ -2367,7 +2814,7 @@ function buildInboxMessage(payload, options = {}) {
   }
 
   if (payload.otpCodes?.length) {
-    lines.push("", "OTP terdeteksi:");
+    lines.push("");
 
     for (const code of payload.otpCodes) {
       lines.push(`<code>${escapeHtml(code)}</code>`);
@@ -2409,7 +2856,7 @@ function buildFullMessageText(payload) {
   ];
 
   if (payload.otpCodes?.length) {
-    lines.push("", "OTP terdeteksi:");
+    lines.push("");
     for (const code of payload.otpCodes) {
       lines.push(`<code>${escapeHtml(code)}</code>`);
     }
@@ -2427,7 +2874,11 @@ function buildAdminMessage(chatId) {
     `Admin: <code>@${escapeHtml(ADMIN_TELEGRAM_USERNAME)}</code>`,
     `Chat ID: <code>${escapeHtml(String(chatId))}</code>`,
     "",
-    "Gunakan tombol di bawah untuk lihat statistik bot.",
+    `Paket Pro: <code>${PREMIUM_HISTORY_PRICE_LABEL}</code> / ${PRO_PLAN_DURATION_DAYS} hari`,
+    `Reminder: <code>H-${PRO_REMINDER_LEAD_DAYS}</code> sebelum habis`,
+    `Limit setelah Pro habis: <code>${DEFAULT_HISTORY_LIMIT}</code> history`,
+    "",
+    "Gunakan tombol di bawah untuk atur paket user.",
   ].join("\n");
 }
 
@@ -2440,7 +2891,107 @@ function buildStatsMessage(stats) {
     `History chat ini: <code>${escapeHtml(String(stats.historyCount))}</code>`,
     `Paket chat ini: <code>${escapeHtml(stats.planName)}</code>`,
     `Premium via secret: <code>${escapeHtml(String(stats.premiumConfiguredCount))}</code>`,
+    `Pro aktif: <code>${escapeHtml(String(stats.activeProCount))}</code>`,
     `Chat ID: <code>${escapeHtml(String(stats.chatId))}</code>`,
+  ].join("\n");
+}
+
+function buildProListMessage(subscriptions) {
+  if (!subscriptions.length) {
+    return [
+      "<b>Daftar Paket Pro</b>",
+      "",
+      "Belum ada user Pro aktif.",
+    ].join("\n");
+  }
+
+  const lines = [
+    "<b>Daftar Paket Pro</b>",
+    "",
+  ];
+
+  for (const item of subscriptions.slice(0, 20)) {
+    lines.push(
+      `Chat: <code>${escapeHtml(item.chatId)}</code>`,
+      `Akhir: <code>${escapeHtml(formatDateTime(item.expiresAt))}</code>`,
+      "",
+    );
+  }
+
+  if (subscriptions.length > 20) {
+    lines.push(`Dan ${escapeHtml(String(subscriptions.length - 20))} user lainnya.`);
+  }
+
+  return lines.join("\n").trim();
+}
+
+function buildAdminChatIdPrompt(actionType, error = "") {
+  const mode = actionType === "admin_removepro" ? "Cabut Pro" : "Set Pro 30 Hari";
+
+  return [
+    `<b>${mode}</b>`,
+    "",
+    error ? escapeHtml(error) : "",
+    "Kirim Chat ID user target.",
+    "Contoh:",
+    "<code>123456789</code>",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function buildAdminSubscriptionResultMessage(chatId, subscription) {
+  return [
+    "<b>Paket Pro diaktifkan</b>",
+    "",
+    `Chat ID: <code>${escapeHtml(String(chatId))}</code>`,
+    `Berakhir: <code>${escapeHtml(formatDateTime(subscription.expiresAt))}</code>`,
+    `Limit history: <code>${PREMIUM_HISTORY_LIMIT}</code>`,
+  ].join("\n");
+}
+
+function buildAdminSubscriptionRemovedResult(chatId) {
+  return [
+    "<b>Paket Pro dicabut</b>",
+    "",
+    `Chat ID: <code>${escapeHtml(String(chatId))}</code>`,
+    `History dibatasi lagi ke <code>${DEFAULT_HISTORY_LIMIT}</code>.`,
+  ].join("\n");
+}
+
+function buildSubscriptionActivatedMessage(subscription) {
+  return [
+    "<b>Paket Pro aktif</b>",
+    "",
+    `History kamu naik jadi <code>${PREMIUM_HISTORY_LIMIT}</code> selama ${PRO_PLAN_DURATION_DAYS} hari.`,
+    `Berakhir: <code>${escapeHtml(formatDateTime(subscription.expiresAt))}</code>`,
+  ].join("\n");
+}
+
+function buildSubscriptionReminderMessage(subscription) {
+  return [
+    "<b>Paket Pro akan segera habis</b>",
+    "",
+    `Masa aktif berakhir: <code>${escapeHtml(formatDateTime(subscription.expiresAt))}</code>`,
+    `Kalau tidak diperpanjang, history akan disisakan <code>${DEFAULT_HISTORY_LIMIT}</code>.`,
+    `Hubungi <a href="${ADMIN_TELEGRAM_URL}">@${escapeHtml(ADMIN_TELEGRAM_USERNAME)}</a> untuk perpanjang.`,
+  ].join("\n");
+}
+
+function buildSubscriptionExpiredMessage() {
+  return [
+    "<b>Paket Pro sudah habis</b>",
+    "",
+    `History kamu kembali ke batas <code>${DEFAULT_HISTORY_LIMIT}</code>.`,
+    `Hubungi <a href="${ADMIN_TELEGRAM_URL}">@${escapeHtml(ADMIN_TELEGRAM_USERNAME)}</a> jika ingin aktif lagi.`,
+  ].join("\n");
+}
+
+function buildSubscriptionRemovedMessage() {
+  return [
+    "<b>Paket Pro dinonaktifkan</b>",
+    "",
+    `History kamu kembali ke batas <code>${DEFAULT_HISTORY_LIMIT}</code>.`,
   ].join("\n");
 }
 
@@ -2451,7 +3002,8 @@ function buildImportUsageMessage(error) {
     error ? escapeHtml(error) : "",
     "",
     "Contoh:",
-    `<code>/import ${DOMAIN_EXAMPLE_FALLBACK} password123</code>`,
+    `<code>/import ${DOMAIN_EXAMPLE_FALLBACK}</code>`,
+    `<code>/import ${DOMAIN_EXAMPLE_FALLBACK} PasswordInboxBot</code>`,
     "<code>/import email-di-history</code>",
   ]
     .filter(Boolean)
@@ -2462,9 +3014,10 @@ function buildImportPromptMessage() {
   return [
     "<b>Import email</b>",
     "",
-    "Kirim email yang ingin diimport, lalu tambahkan password jika email itu belum ada di history.",
+    "Kirim email bot yang ingin direcovery.",
     "Contoh:",
-    `<code>${DOMAIN_EXAMPLE_FALLBACK} password123</code>`,
+    `<code>${DOMAIN_EXAMPLE_FALLBACK}</code>`,
+    `<code>${DOMAIN_EXAMPLE_FALLBACK} PasswordInboxBot</code>`,
     "<code>email-di-history</code>",
   ].join("\n");
 }
@@ -2496,7 +3049,8 @@ function buildUnknownCommandMessage() {
     "<code>/note email catatan</code>",
     "<code>/inbox email</code>",
     "<code>/refresh email</code>",
-    "<code>/import email password</code>",
+    "<code>/import email</code>",
+    "<code>/import email password-bot</code>",
   ].join("\n");
 }
 
@@ -2536,24 +3090,12 @@ function buildMailboxKeyboard(targetEmail, historyState, payload = null) {
       { text: "Pindah Email", callback_data: "history_select:0" },
     ],
     [
-      { text: "Copy Email", callback_data: "copy_email" },
-      { text: "Copy OTP", callback_data: "copy_otp" },
-    ],
-    [
-      { text: "Copy Password", callback_data: "copy_password" },
-      { text: "Copy VCC", callback_data: "copy_vcc" },
-    ],
-    [
-      { text: "Copy CVV", callback_data: "copy_cvv" },
       { text: "Catatan", callback_data: `note_prompt:${key}` },
-    ],
-    [
       { text: "Hapus Email", callback_data: `delete:${key}` },
-      { text: "Import Email", callback_data: "import_prompt" },
     ],
     [
       { text: "Email Baru", callback_data: "new" },
-      { text: "History", callback_data: "history" },
+      { text: "Import Email", callback_data: "import_prompt" },
     ],
   ];
 
@@ -2582,10 +3124,6 @@ function buildMessageDetailKeyboard(targetEmail, historyState, payload) {
   const key = reference.ok ? reference.email : String(targetEmail ?? "");
   const rows = [
     [
-      { text: "Copy OTP", callback_data: "copy_otp" },
-      { text: "Copy Email", callback_data: "copy_email" },
-    ],
-    [
       { text: "Refresh Inbox", callback_data: `refresh:${key}` },
       { text: "Delete Message", callback_data: `delmsg:${payload.id}` },
     ],
@@ -2599,7 +3137,11 @@ function buildAdminKeyboard(historyState) {
     inline_keyboard: [
       [
         { text: "Stats", callback_data: "stats" },
-        { text: "History", callback_data: "history" },
+        { text: "List Pro", callback_data: "admin_listpro" },
+      ],
+      [
+        { text: "Set Pro 30 Hari", callback_data: "admin_setpro" },
+        { text: "Cabut Pro", callback_data: "admin_removepro" },
       ],
       [{ text: "Email Baru", callback_data: "new" }],
       ...(historyState.isAdmin ? [[{ text: "Admin Tools", callback_data: "admin" }]] : []),
@@ -2832,24 +3374,65 @@ function resolveImportInput(rawText, historyState) {
   }
 
   const historyEntry = findHistoryEntry(historyState, reference.email || reference.localPart);
-  const password = restTokens.join(" ").trim() || historyEntry?.passwordSuggestion || "";
   const email = historyEntry?.email || reference.email;
-
-  if (!email.includes("@")) {
-    return { ok: false, error: "Untuk import email di luar bot, kirim email lengkap beserta password." };
-  }
-
-  if (!password) {
-    return { ok: false, error: "Password email belum ada. Gunakan format: email password" };
-  }
+  const providedPassword = restTokens.join(" ").trim();
 
   return {
     ok: true,
     email,
     localPart: reference.localPart,
-    password,
+    providedPassword,
     historyEntry,
   };
+}
+
+async function resolveImportAccess(env, importInput) {
+  if (!importInput?.ok) {
+    return importInput;
+  }
+
+  if (!String(importInput.email || "").includes("@")) {
+    return {
+      ok: false,
+      error: "Gunakan alamat email lengkap yang dibuat bot.",
+    };
+  }
+
+  const deterministicPassword = await generateInboxPassword(importInput.email, env);
+
+  if (importInput.providedPassword) {
+    if (importInput.providedPassword !== deterministicPassword) {
+      return {
+        ok: false,
+        error: "Import hanya untuk email yang dibuat bot. Gunakan Password inbox bot yang benar.",
+      };
+    }
+
+    return {
+      ok: true,
+      email: importInput.email,
+      localPart: importInput.localPart,
+      password: deterministicPassword,
+      historyEntry: importInput.historyEntry,
+      passwordSource: "provided",
+      allowDeterministicPassword: false,
+    };
+  }
+
+  return {
+    ok: true,
+    email: importInput.email,
+    localPart: importInput.localPart,
+    password: deterministicPassword,
+    historyEntry: importInput.historyEntry,
+    passwordSource: "deterministic",
+    allowDeterministicPassword: true,
+  };
+}
+
+function parseChatIdInput(text) {
+  const match = String(text ?? "").trim().match(/-?\d{4,20}/);
+  return match?.[0] || "";
 }
 
 function parseMailboxReference(text) {
@@ -2980,6 +3563,10 @@ function formatMessageDate(value) {
   return `${date.getUTCFullYear()}-${padNumber(date.getUTCMonth() + 1)}-${padNumber(date.getUTCDate())} ${padNumber(date.getUTCHours())}:${padNumber(date.getUTCMinutes())} UTC`;
 }
 
+function formatDateTime(value) {
+  return formatMessageDate(new Date(Number(value || 0)).toISOString());
+}
+
 function buildCopyPayloadFromBotText(action, botText, historyState) {
   const email = extractEmailFromText(botText);
   const historyEntry = email ? findHistoryEntry(historyState, email) : null;
@@ -2992,7 +3579,10 @@ function buildCopyPayloadFromBotText(action, botText, historyState) {
       }
     : {
         email,
-        passwordSuggestion: extractLabeledValue(botText, "Password saran") || extractLabeledValue(botText, "Password"),
+        passwordSuggestion:
+          extractLabeledValue(botText, "Password inbox") ||
+          extractLabeledValue(botText, "Password saran") ||
+          extractLabeledValue(botText, "Password"),
         vcc: {
           number: extractNextLineValue(botText, "VCC dummy") || "",
           expText: extractInlineValue(botText, "Exp") || "",
@@ -3154,6 +3744,103 @@ export class TempMGenState {
         {
           ok: true,
           pending: null,
+        },
+        200,
+      );
+    }
+
+    if (url.pathname === "/subscription_get") {
+      return json(
+        {
+          ok: true,
+          subscription: await this.readSubscription(),
+        },
+        200,
+      );
+    }
+
+    if (url.pathname === "/subscription_set") {
+      const subscription = normalizeSubscriptionRecord(body?.subscription, body?.subscription?.chatId);
+      await this.writeSubscription(subscription);
+
+      return json(
+        {
+          ok: true,
+          subscription,
+        },
+        200,
+      );
+    }
+
+    if (url.pathname === "/subscription_clear") {
+      await this.writeSubscription(null);
+
+      return json(
+        {
+          ok: true,
+          subscription: null,
+        },
+        200,
+      );
+    }
+
+    if (url.pathname === "/prune") {
+      const items = await this.readHistory();
+      const limit = normalizeHistoryLimit(body?.limit, {});
+      const nextItems = limit === null ? items : items.slice(0, limit);
+      await this.writeHistory(nextItems);
+
+      return json(
+        {
+          ok: true,
+          items: nextItems,
+          count: nextItems.length,
+        },
+        200,
+      );
+    }
+
+    if (url.pathname === "/subscription_list") {
+      return json(
+        {
+          ok: true,
+          items: await this.readRegistrySubscriptions(),
+        },
+        200,
+      );
+    }
+
+    if (url.pathname === "/subscription_upsert") {
+      const subscription = normalizeSubscriptionRecord(body?.subscription, body?.subscription?.chatId);
+      const items = await this.readRegistrySubscriptions();
+      const nextItems = items.filter((item) => item.chatId !== subscription?.chatId);
+
+      if (subscription) {
+        nextItems.unshift(subscription);
+      }
+
+      await this.writeRegistrySubscriptions(nextItems);
+
+      return json(
+        {
+          ok: true,
+          subscription,
+          items: nextItems,
+        },
+        200,
+      );
+    }
+
+    if (url.pathname === "/subscription_remove") {
+      const items = await this.readRegistrySubscriptions();
+      const chatId = String(body?.chatId ?? "").trim();
+      const nextItems = items.filter((item) => item.chatId !== chatId);
+      await this.writeRegistrySubscriptions(nextItems);
+
+      return json(
+        {
+          ok: true,
+          items: nextItems,
         },
         200,
       );
@@ -3365,5 +4052,35 @@ export class TempMGenState {
     }
 
     await this.state.storage.delete("pending");
+  }
+
+  async readSubscription() {
+    const stored = await this.state.storage.get("subscription");
+    return normalizeSubscriptionRecord(stored, stored?.chatId);
+  }
+
+  async writeSubscription(subscription) {
+    if (subscription) {
+      await this.state.storage.put("subscription", normalizeSubscriptionRecord(subscription, subscription.chatId));
+      return;
+    }
+
+    await this.state.storage.delete("subscription");
+  }
+
+  async readRegistrySubscriptions() {
+    const stored = await this.state.storage.get("subscription_registry");
+    return Array.isArray(stored)
+      ? stored.map((item) => normalizeSubscriptionRecord(item, item?.chatId)).filter(Boolean)
+      : [];
+  }
+
+  async writeRegistrySubscriptions(items) {
+    await this.state.storage.put(
+      "subscription_registry",
+      Array.isArray(items)
+        ? items.map((item) => normalizeSubscriptionRecord(item, item?.chatId)).filter(Boolean)
+        : [],
+    );
   }
 }
