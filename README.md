@@ -6,7 +6,8 @@ Web app sederhana untuk:
 - kunci domain output ke `@pokemail.net`
 - pakai session Guerrilla Mail di balik Worker
 - terima update Telegram lewat webhook Worker
-- sediakan command bot `/start`, `/new`, `/inbox`, `/refresh`, dan `/import`
+- sediakan command bot `/start`, `/new`, `/history`, `/inbox`, `/refresh`, dan `/import`
+- simpan history email Telegram dengan batas default 5 dan premium 25
 
 ## Stack
 
@@ -42,6 +43,7 @@ Command yang sudah aktif:
 
 - `/start`
 - `/new`
+- `/history`
 - `/inbox`
 - `/refresh`
 - `/import`
@@ -50,6 +52,7 @@ Command yang sudah aktif:
 
 - `TELEGRAM_BOT_TOKEN` wajib
 - `TELEGRAM_WEBHOOK_SECRET` opsional tapi direkomendasikan
+- `PREMIUM_CHAT_IDS` opsional untuk menandai chat premium agar limit history naik ke 25
 
 ### Set webhook Telegram
 
@@ -75,10 +78,20 @@ curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<w
 
 - `/start` menampilkan bantuan bot
 - `/new` membuat email baru seperti `andipakukediri99@pokemail.net`
+- `/history` menampilkan history email user
 - `/inbox email@pokemail.net` membuka inbox email itu
 - `/refresh email@pokemail.net` mengambil inbox terbaru untuk email itu
 - `/import email@pokemail.net` memulihkan email lama agar bisa dipakai lagi di bot
-- tombol inline `Inbox` dan `Refresh` ikut dikirim di pesan bot agar tidak perlu ketik ulang email
+- tombol inline `Inbox`, `Refresh`, `History`, dan `Pembelian 5k/bulan` ikut dikirim di pesan bot
+
+### History email
+
+- limit default: `5` email per chat Telegram
+- limit premium: `25` email per chat Telegram
+- saat history penuh, bot menolak generate/import email baru dan menampilkan pesan error
+- tombol `Pembelian 5k/bulan` menampilkan info upgrade untuk menaikkan history dari 5 ke 25
+
+Cloudflare Durable Object dipakai untuk menyimpan history email per chat.
 
 ## GitHub Actions Auto Deploy
 
@@ -131,6 +144,14 @@ Webhook secret opsional:
 npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
 ```
 
+Chat premium opsional:
+
+```bash
+npx wrangler secret put PREMIUM_CHAT_IDS
+```
+
+Isi `PREMIUM_CHAT_IDS` dengan daftar chat ID premium dipisah koma atau baris baru.
+
 Kalau nanti kamu mau sinkronkan secret Telegram lewat GitHub Actions juga, saya bisa tambahkan step khusus setelah kamu menyiapkan secret GitHub `TELEGRAM_BOT_TOKEN`.
 
 ## Jalankan lokal
@@ -153,3 +174,4 @@ npm run deploy
 - App ini sengaja mengunci domain ke `@pokemail.net`
 - `actualEmail` dari Guerrilla bisa berbeda domain, tetapi inbox session tetap dipakai untuk menerima email
 - Webhook Telegram ada di `/telegram/webhook`
+- History email Telegram disimpan di Durable Object `TempMGenState`

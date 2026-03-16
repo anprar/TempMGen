@@ -1,6 +1,11 @@
 const GUERRILLA_API_URL = "https://api.guerrillamail.com/ajax.php";
 const SESSION_COOKIE = "TEMPMGEN_GMSESSID";
 const FIXED_DOMAIN = "pokemail.net";
+const DEFAULT_HISTORY_LIMIT = 5;
+const PREMIUM_HISTORY_LIMIT = 25;
+const PREMIUM_HISTORY_PRICE_LABEL = "5k/bulan";
+const MAX_STORED_HISTORY = PREMIUM_HISTORY_LIMIT;
+const FALLBACK_HISTORY_STORE = new Map();
 const PEOPLE = [
   "andi",
   "budi",
@@ -173,6 +178,9 @@ export default {
           hasTelegramToken: Boolean(env.TELEGRAM_BOT_TOKEN),
           telegramWebhookPath: "/telegram/webhook",
           hasTelegramWebhookSecret: Boolean(env.TELEGRAM_WEBHOOK_SECRET),
+          defaultHistoryLimit: DEFAULT_HISTORY_LIMIT,
+          premiumHistoryLimit: PREMIUM_HISTORY_LIMIT,
+          hasHistoryStorage: Boolean(env.TEMP_MGEN_STATE),
         },
         200,
       );
@@ -273,21 +281,46 @@ async function handleTelegramWebhook(request, env) {
   const text = String(message?.text ?? "").trim();
   const parsedCommand = parseTelegramCommand(text);
   const command = parsedCommand.command;
+  const plan = getChatPlan(env, chatId);
 
   if (!chatId || !command) {
     return json({ ok: true, ignored: true }, 200);
   }
 
   if (command === "start") {
-    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildStartMessage(), {
+    const historyState = await getHistoryState(env, chatId, plan);
+
+    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildStartMessage(historyState), {
       parse_mode: "HTML",
-      reply_markup: buildNewEmailKeyboard(),
+      reply_markup: buildHomeKeyboard(historyState),
+    });
+
+    return json({ ok: true, handled: true, command }, 200);
+  }
+
+  if (command === "history") {
+    const historyState = await getHistoryState(env, chatId, plan);
+
+    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildHistoryMessage(historyState), {
+      parse_mode: "HTML",
+      reply_markup: buildHomeKeyboard(historyState),
     });
 
     return json({ ok: true, handled: true, command }, 200);
   }
 
   if (command === "new") {
+    const historyState = await getHistoryState(env, chatId, plan);
+
+    if (historyState.count >= historyState.limit) {
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildHistoryLimitMessage(historyState), {
+        parse_mode: "HTML",
+        reply_markup: buildHomeKeyboard(historyState),
+      });
+
+      return json({ ok: true, handled: true, command, error: "History limit reached" }, 200);
+    }
+
     const result = await generateMailbox(request);
 
     if (!result.ok) {
@@ -301,9 +334,20 @@ async function handleTelegramWebhook(request, env) {
       return json({ ok: false, handled: true, command, error: result.error }, 502);
     }
 
-    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildNewEmailMessage(result.payload), {
+    const historyRecord = await recordHistoryEntry(env, chatId, result.payload, "generated", plan);
+
+    if (!historyRecord.ok) {
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildHistoryLimitMessage(historyRecord), {
+        parse_mode: "HTML",
+        reply_markup: buildHomeKeyboard(historyRecord),
+      });
+
+      return json({ ok: true, handled: true, command, error: "History limit reached" }, 200);
+    }
+
+    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildNewEmailMessage(result.payload, historyRecord), {
       parse_mode: "HTML",
-      reply_markup: buildMailboxKeyboard(result.payload.username),
+      reply_markup: buildMailboxKeyboard(result.payload.username, historyRecord),
     });
 
     return json({ ok: true, handled: true, command, email: result.payload.email }, 200);
@@ -320,6 +364,17 @@ async function handleTelegramWebhook(request, env) {
       return json({ ok: true, handled: true, command, error: reference.error }, 200);
     }
 
+    const historyState = await getHistoryState(env, chatId, plan);
+
+    if (historyState.count >= historyState.limit && !hasHistoryEmail(historyState, reference.email)) {
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildHistoryLimitMessage(historyState), {
+        parse_mode: "HTML",
+        reply_markup: buildHomeKeyboard(historyState),
+      });
+
+      return json({ ok: true, handled: true, command, error: "History limit reached" }, 200);
+    }
+
     const inboxResult = await getMailboxInbox(request, reference.localPart);
 
     if (!inboxResult.ok) {
@@ -333,9 +388,20 @@ async function handleTelegramWebhook(request, env) {
       return json({ ok: false, handled: true, command, error: inboxResult.error }, 502);
     }
 
-    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildImportSuccessMessage(inboxResult.payload), {
+    const historyRecord = await recordHistoryEntry(env, chatId, inboxResult.payload, "imported", plan);
+
+    if (!historyRecord.ok) {
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildHistoryLimitMessage(historyRecord), {
+        parse_mode: "HTML",
+        reply_markup: buildHomeKeyboard(historyRecord),
+      });
+
+      return json({ ok: true, handled: true, command, error: "History limit reached" }, 200);
+    }
+
+    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildImportSuccessMessage(inboxResult.payload, historyRecord), {
       parse_mode: "HTML",
-      reply_markup: buildMailboxKeyboard(reference.localPart),
+      reply_markup: buildMailboxKeyboard(reference.localPart, historyRecord),
     });
 
     return json({ ok: true, handled: true, command, email: inboxResult.payload.email }, 200);
@@ -365,22 +431,26 @@ async function handleTelegramWebhook(request, env) {
       return json({ ok: false, handled: true, command, error: inboxResult.error }, 502);
     }
 
+    const historyState = await getHistoryState(env, chatId, plan);
+
     await sendTelegramMessage(
       env.TELEGRAM_BOT_TOKEN,
       chatId,
       buildInboxMessage(inboxResult.payload, { refreshed: command === "refresh" }),
       {
         parse_mode: "HTML",
-        reply_markup: buildMailboxKeyboard(reference.localPart),
+        reply_markup: buildMailboxKeyboard(reference.localPart, historyState),
       },
     );
 
     return json({ ok: true, handled: true, command, email: inboxResult.payload.email }, 200);
   }
 
+  const historyState = await getHistoryState(env, chatId, plan);
+
   await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildUnknownCommandMessage(), {
     parse_mode: "HTML",
-    reply_markup: buildNewEmailKeyboard(),
+    reply_markup: buildHomeKeyboard(historyState),
   });
 
   return json({ ok: true, handled: true, command }, 200);
@@ -397,6 +467,19 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
 
   try {
     if (data === "new") {
+      const plan = getChatPlan(env, chatId);
+      const historyState = await getHistoryState(env, chatId, plan);
+
+      if (historyState.count >= historyState.limit) {
+        await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "History penuh.", true);
+        await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildHistoryLimitMessage(historyState), {
+          parse_mode: "HTML",
+          reply_markup: buildHomeKeyboard(historyState),
+        });
+
+        return json({ ok: true, handled: true, callback: data, error: "History limit reached" }, 200);
+      }
+
       const result = await generateMailbox(request);
 
       if (!result.ok) {
@@ -416,13 +499,51 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
         return json({ ok: false, handled: true, callback: data, error: result.error }, 502);
       }
 
+      const historyRecord = await recordHistoryEntry(env, chatId, result.payload, "generated", plan);
+
+      if (!historyRecord.ok) {
+        await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "History penuh.", true);
+        await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildHistoryLimitMessage(historyRecord), {
+          parse_mode: "HTML",
+          reply_markup: buildHomeKeyboard(historyRecord),
+        });
+
+        return json({ ok: true, handled: true, callback: data, error: "History limit reached" }, 200);
+      }
+
       await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Email baru dibuat.");
-      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildNewEmailMessage(result.payload), {
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildNewEmailMessage(result.payload, historyRecord), {
         parse_mode: "HTML",
-        reply_markup: buildMailboxKeyboard(result.payload.username),
+        reply_markup: buildMailboxKeyboard(result.payload.username, historyRecord),
       });
 
       return json({ ok: true, handled: true, callback: data, email: result.payload.email }, 200);
+    }
+
+    if (data === "history") {
+      const plan = getChatPlan(env, chatId);
+      const historyState = await getHistoryState(env, chatId, plan);
+
+      await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "History ditampilkan.");
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildHistoryMessage(historyState), {
+        parse_mode: "HTML",
+        reply_markup: buildHomeKeyboard(historyState),
+      });
+
+      return json({ ok: true, handled: true, callback: data }, 200);
+    }
+
+    if (data === "buy_history") {
+      const plan = getChatPlan(env, chatId);
+      const historyState = await getHistoryState(env, chatId, plan);
+
+      await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Info pembelian dikirim.");
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildBuyHistoryMessage(chatId, historyState), {
+        parse_mode: "HTML",
+        reply_markup: buildHomeKeyboard(historyState),
+      });
+
+      return json({ ok: true, handled: true, callback: data }, 200);
     }
 
     const separator = data.indexOf(":");
@@ -454,6 +575,8 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
       return json({ ok: false, handled: true, callback: data, error: inboxResult.error }, 502);
     }
 
+    const historyState = await getHistoryState(env, chatId, getChatPlan(env, chatId));
+
     await answerTelegramCallbackQuery(
       env.TELEGRAM_BOT_TOKEN,
       callbackId,
@@ -465,7 +588,7 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
       buildInboxMessage(inboxResult.payload, { refreshed: action === "refresh" }),
       {
         parse_mode: "HTML",
-        reply_markup: buildMailboxKeyboard(mailbox.localPart),
+        reply_markup: buildMailboxKeyboard(mailbox.localPart, historyState),
       },
     );
 
@@ -670,6 +793,233 @@ function randomInt(max) {
   return array[0] % max;
 }
 
+function getChatPlan(env, chatId) {
+  const premiumChatIds = parsePremiumChatIds(env?.PREMIUM_CHAT_IDS);
+  const isPremium = premiumChatIds.has(String(chatId ?? ""));
+
+  return {
+    isPremium,
+    limit: isPremium ? PREMIUM_HISTORY_LIMIT : DEFAULT_HISTORY_LIMIT,
+    upgradePriceLabel: PREMIUM_HISTORY_PRICE_LABEL,
+  };
+}
+
+function parsePremiumChatIds(value) {
+  const set = new Set();
+
+  for (const item of String(value ?? "").split(/[\s,]+/)) {
+    const trimmed = item.trim();
+    if (trimmed) {
+      set.add(trimmed);
+    }
+  }
+
+  return set;
+}
+
+async function getHistoryState(env, chatId, plan = getChatPlan(env, chatId)) {
+  const result = await invokeHistoryStore(env, chatId, "/state", {
+    limit: plan.limit,
+    isPremium: plan.isPremium,
+  });
+
+  return normalizeHistoryState(result, plan);
+}
+
+async function recordHistoryEntry(env, chatId, payload, source, plan = getChatPlan(env, chatId)) {
+  const result = await invokeHistoryStore(env, chatId, "/record", {
+    email: payload.email,
+    localPart: payload.username,
+    source,
+    limit: plan.limit,
+    isPremium: plan.isPremium,
+  });
+
+  return normalizeHistoryState(result, plan);
+}
+
+async function invokeHistoryStore(env, chatId, path, payload) {
+  if (env?.TEMP_MGEN_STATE) {
+    const id = env.TEMP_MGEN_STATE.idFromName(`chat:${chatId}`);
+    const stub = env.TEMP_MGEN_STATE.get(id);
+    const response = await stub.fetch(`https://history${path}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    return response.json();
+  }
+
+  return fallbackHistoryStoreFetch(chatId, path, payload);
+}
+
+function fallbackHistoryStoreFetch(chatId, path, payload) {
+  const key = String(chatId ?? "unknown");
+  const existing = normalizeStoredHistory(FALLBACK_HISTORY_STORE.get(key));
+
+  if (path === "/state") {
+    return {
+      ok: true,
+      items: existing,
+      count: existing.length,
+    };
+  }
+
+  if (path !== "/record") {
+    return {
+      ok: false,
+      error: "Unknown history operation.",
+      items: existing,
+      count: existing.length,
+    };
+  }
+
+  const localPart = normalizeLocalPart(payload?.localPart);
+  const email = formatHistoryEmail(payload?.email, localPart);
+  const limit = normalizeHistoryLimit(payload?.limit, Boolean(payload?.isPremium));
+
+  if (!localPart || !email) {
+    return {
+      ok: false,
+      error: "History email is invalid.",
+      items: existing,
+      count: existing.length,
+    };
+  }
+
+  const updated = [...existing];
+  const existingIndex = updated.findIndex((item) => item.localPart === localPart || item.email === email);
+
+  if (existingIndex >= 0) {
+    const [current] = updated.splice(existingIndex, 1);
+    updated.unshift({
+      ...current,
+      email,
+      localPart,
+      source: normalizeHistorySource(payload?.source, current.source),
+      updatedAt: Date.now(),
+    });
+    FALLBACK_HISTORY_STORE.set(key, updated.slice(0, MAX_STORED_HISTORY));
+
+    return {
+      ok: true,
+      items: updated,
+      count: updated.length,
+    };
+  }
+
+  if (updated.length >= limit) {
+    return {
+      ok: false,
+      code: "limit_reached",
+      items: updated,
+      count: updated.length,
+    };
+  }
+
+  updated.unshift({
+    email,
+    localPart,
+    source: normalizeHistorySource(payload?.source),
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+  FALLBACK_HISTORY_STORE.set(key, updated.slice(0, MAX_STORED_HISTORY));
+
+  return {
+    ok: true,
+    items: updated,
+    count: updated.length,
+  };
+}
+
+function normalizeHistoryState(result, plan) {
+  const items = normalizeStoredHistory(result?.items);
+
+  return {
+    ok: Boolean(result?.ok),
+    code: result?.code || "",
+    error: result?.error || "",
+    items,
+    count: items.length,
+    limit: plan.limit,
+    isPremium: plan.isPremium,
+    upgradePriceLabel: plan.upgradePriceLabel,
+  };
+}
+
+function normalizeStoredHistory(items) {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  return items
+    .map((item) => {
+      const localPart = normalizeLocalPart(item?.localPart);
+      const email = formatHistoryEmail(item?.email, localPart);
+
+      if (!localPart || !email) {
+        return null;
+      }
+
+      return {
+        email,
+        localPart,
+        source: normalizeHistorySource(item?.source),
+        createdAt: Number(item?.createdAt || 0),
+        updatedAt: Number(item?.updatedAt || 0),
+      };
+    })
+    .filter(Boolean)
+    .slice(0, MAX_STORED_HISTORY);
+}
+
+function normalizeHistorySource(value, fallback = "generated") {
+  const normalized = String(value ?? fallback).trim().toLowerCase();
+  return normalized === "imported" ? "imported" : "generated";
+}
+
+function normalizeHistoryLimit(value, isPremium = false) {
+  const fallback = isPremium ? PREMIUM_HISTORY_LIMIT : DEFAULT_HISTORY_LIMIT;
+  const parsed = Number.parseInt(String(value ?? fallback), 10);
+
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+
+  return Math.min(PREMIUM_HISTORY_LIMIT, Math.max(DEFAULT_HISTORY_LIMIT, parsed));
+}
+
+function formatHistoryEmail(email, localPart) {
+  const normalizedLocalPart = normalizeLocalPart(localPart || email);
+  const normalizedEmail = String(email ?? "").trim().toLowerCase();
+
+  if (normalizedEmail.endsWith(`@${FIXED_DOMAIN}`)) {
+    return normalizedEmail;
+  }
+
+  if (!normalizedLocalPart) {
+    return "";
+  }
+
+  return `${normalizedLocalPart}@${FIXED_DOMAIN}`;
+}
+
+function hasHistoryEmail(historyState, email) {
+  const reference = parseMailboxReference(email);
+
+  if (!reference.ok) {
+    return false;
+  }
+
+  return historyState.items.some(
+    (item) => item.email === reference.email || item.localPart === reference.localPart,
+  );
+}
+
 function parseTelegramCommand(text) {
   const match = text.match(/^\/([a-z0-9_]+)(?:@[a-z0-9_]+)?(?:\s+([\s\S]*))?$/i);
   return {
@@ -678,27 +1028,31 @@ function parseTelegramCommand(text) {
   };
 }
 
-function buildStartMessage() {
+function buildStartMessage(historyState) {
   return [
     "<b>TempMGen siap dipakai</b>",
     "",
     `Domain tetap: <code>@${FIXED_DOMAIN}</code>`,
     "Pola nama: <code>nama + benda + kota + angka 0-99</code>",
+    `History: <code>${escapeHtml(String(historyState.count))}/${escapeHtml(String(historyState.limit))}</code>`,
+    `Paket: <code>${historyState.isPremium ? "Premium" : "Basic"}</code>`,
     "",
     "Perintah:",
     "<code>/new</code> - generate email baru",
     "<code>/inbox email@pokemail.net</code> - lihat inbox",
     "<code>/refresh email@pokemail.net</code> - refresh inbox",
     "<code>/import email@pokemail.net</code> - reuse atau recovery email",
+    "<code>/history</code> - lihat history email",
     "<code>/start</code> - tampilkan bantuan ini",
   ].join("\n");
 }
 
-function buildNewEmailMessage(payload) {
+function buildNewEmailMessage(payload, historyState) {
   return [
     "<b>Email baru berhasil dibuat</b>",
     "",
     `<code>${escapeHtml(payload.email)}</code>`,
+    `History: <code>${escapeHtml(String(historyState.count))}/${escapeHtml(String(historyState.limit))}</code>`,
     "",
     "Komposisi:",
     `- nama: <code>${escapeHtml(payload.parts.person)}</code>`,
@@ -710,14 +1064,74 @@ function buildNewEmailMessage(payload) {
   ].join("\n");
 }
 
-function buildImportSuccessMessage(payload) {
+function buildImportSuccessMessage(payload, historyState) {
   return [
     "<b>Email berhasil di-import</b>",
     "",
     `<code>${escapeHtml(payload.email)}</code>`,
     `Pesan terdeteksi: <code>${escapeHtml(String(payload.messageCount))}</code>`,
+    `History: <code>${escapeHtml(String(historyState.count))}/${escapeHtml(String(historyState.limit))}</code>`,
     "",
     "Gunakan tombol di bawah untuk buka atau refresh inbox.",
+  ].join("\n");
+}
+
+function buildHistoryMessage(historyState) {
+  const lines = [
+    "<b>History email</b>",
+    "",
+    `Paket: <code>${historyState.isPremium ? "Premium" : "Basic"}</code>`,
+    `Terpakai: <code>${escapeHtml(String(historyState.count))}/${escapeHtml(String(historyState.limit))}</code>`,
+  ];
+
+  if (!historyState.items.length) {
+    lines.push("", "Belum ada email di history.", "Kirim <code>/new</code> untuk membuat email pertama.");
+    return lines.join("\n");
+  }
+
+  lines.push("", "Daftar email:");
+
+  for (const [index, item] of historyState.items.entries()) {
+    lines.push(`${index + 1}. <code>${escapeHtml(item.email)}</code>`);
+  }
+
+  lines.push("", "Gunakan <code>/import email@pokemail.net</code> untuk recovery email tertentu.");
+
+  return lines.join("\n");
+}
+
+function buildHistoryLimitMessage(historyState) {
+  const lines = [
+    "<b>History email sudah penuh</b>",
+    "",
+    `Terpakai: <code>${escapeHtml(String(historyState.count))}/${escapeHtml(String(historyState.limit))}</code>`,
+  ];
+
+  if (historyState.isPremium) {
+    lines.push("", "Limit premium kamu sudah penuh. Gunakan email yang ada di history atau lakukan import email lama.");
+    return lines.join("\n");
+  }
+
+  lines.push(
+    "",
+    `Upgrade <code>${escapeHtml(historyState.upgradePriceLabel)}</code> untuk menaikkan limit history menjadi <code>${PREMIUM_HISTORY_LIMIT}</code> email.`,
+    "Tekan tombol pembelian di bawah untuk info upgrade.",
+  );
+
+  return lines.join("\n");
+}
+
+function buildBuyHistoryMessage(chatId, historyState) {
+  return [
+    "<b>Upgrade history email</b>",
+    "",
+    `Harga: <code>${escapeHtml(historyState.upgradePriceLabel)}</code>`,
+    `Limit: <code>${DEFAULT_HISTORY_LIMIT}</code> -> <code>${PREMIUM_HISTORY_LIMIT}</code> history email`,
+    "",
+    "Kirim Chat ID ini ke admin untuk aktivasi premium:",
+    `<code>${escapeHtml(String(chatId))}</code>`,
+    "",
+    "Setelah pembayaran aktif, admin bisa menambahkan Chat ID kamu ke daftar premium.",
   ].join("\n");
 }
 
@@ -788,28 +1202,45 @@ function buildUnknownCommandMessage() {
     "Gunakan:",
     "<code>/start</code>",
     "<code>/new</code>",
+    "<code>/history</code>",
     "<code>/inbox email@pokemail.net</code>",
     "<code>/refresh email@pokemail.net</code>",
     "<code>/import email@pokemail.net</code>",
   ].join("\n");
 }
 
-function buildNewEmailKeyboard() {
-  return {
-    inline_keyboard: [[{ text: "New Email", callback_data: "new" }]],
-  };
+function buildHomeKeyboard(historyState) {
+  const rows = [
+    [
+      { text: "New Email", callback_data: "new" },
+      { text: "History", callback_data: "history" },
+    ],
+  ];
+
+  if (!historyState.isPremium) {
+    rows.push([{ text: "Pembelian 5k/bulan", callback_data: "buy_history" }]);
+  }
+
+  return { inline_keyboard: rows };
 }
 
-function buildMailboxKeyboard(localPart) {
-  return {
-    inline_keyboard: [
-      [
-        { text: "Inbox", callback_data: `inbox:${localPart}` },
-        { text: "Refresh", callback_data: `refresh:${localPart}` },
-      ],
-      [{ text: "New Email", callback_data: "new" }],
+function buildMailboxKeyboard(localPart, historyState) {
+  const rows = [
+    [
+      { text: "Inbox", callback_data: `inbox:${localPart}` },
+      { text: "Refresh", callback_data: `refresh:${localPart}` },
     ],
-  };
+    [
+      { text: "History", callback_data: "history" },
+      { text: "New Email", callback_data: "new" },
+    ],
+  ];
+
+  if (!historyState.isPremium) {
+    rows.push([{ text: "Pembelian 5k/bulan", callback_data: "buy_history" }]);
+  }
+
+  return { inline_keyboard: rows };
 }
 
 async function sendTelegramMessage(token, chatId, text, extra = {}) {
@@ -994,4 +1425,125 @@ function json(payload, status) {
       "cache-control": "no-store",
     },
   });
+}
+
+export class TempMGenState {
+  constructor(state) {
+    this.state = state;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+
+    if (request.method !== "POST") {
+      return json({ ok: false, error: "Method not allowed." }, 405);
+    }
+
+    let body = {};
+
+    try {
+      body = await request.json();
+    } catch {
+      body = {};
+    }
+
+    if (url.pathname === "/state") {
+      const items = await this.readHistory();
+
+      return json(
+        {
+          ok: true,
+          items,
+          count: items.length,
+        },
+        200,
+      );
+    }
+
+    if (url.pathname === "/record") {
+      const items = await this.readHistory();
+      const localPart = normalizeLocalPart(body?.localPart);
+      const email = formatHistoryEmail(body?.email, localPart);
+      const limit = normalizeHistoryLimit(body?.limit, Boolean(body?.isPremium));
+
+      if (!localPart || !email) {
+        return json(
+          {
+            ok: false,
+            error: "History email is invalid.",
+            items,
+            count: items.length,
+          },
+          200,
+        );
+      }
+
+      const nextItems = [...items];
+      const existingIndex = nextItems.findIndex(
+        (item) => item.localPart === localPart || item.email === email,
+      );
+
+      if (existingIndex >= 0) {
+        const [current] = nextItems.splice(existingIndex, 1);
+        nextItems.unshift({
+          ...current,
+          email,
+          localPart,
+          source: normalizeHistorySource(body?.source, current.source),
+          updatedAt: Date.now(),
+        });
+        await this.writeHistory(nextItems);
+
+        return json(
+          {
+            ok: true,
+            items: nextItems,
+            count: nextItems.length,
+          },
+          200,
+        );
+      }
+
+      if (nextItems.length >= limit) {
+        return json(
+          {
+            ok: false,
+            code: "limit_reached",
+            items: nextItems,
+            count: nextItems.length,
+          },
+          200,
+        );
+      }
+
+      nextItems.unshift({
+        email,
+        localPart,
+        source: normalizeHistorySource(body?.source),
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      await this.writeHistory(nextItems);
+
+      return json(
+        {
+          ok: true,
+          items: nextItems,
+          count: nextItems.length,
+        },
+        200,
+      );
+    }
+
+    return json({ ok: false, error: "Route not found." }, 404);
+  }
+
+  async readHistory() {
+    const stored = await this.state.storage.get("history");
+    return normalizeStoredHistory(stored);
+  }
+
+  async writeHistory(items) {
+    await this.state.storage.put("history", normalizeStoredHistory(items));
+  }
 }

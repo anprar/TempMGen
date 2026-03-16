@@ -7,6 +7,22 @@
     "directory": "./public",
     "binding": "ASSETS"
   },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "TEMP_MGEN_STATE",
+        "class_name": "TempMGenState"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "TempMGenState"
+      ]
+    }
+  ],
   "observability": {
     "enabled": true
   }
