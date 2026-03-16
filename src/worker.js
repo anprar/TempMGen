@@ -4,7 +4,10 @@ const FIXED_DOMAIN = "pokemail.net";
 const DEFAULT_HISTORY_LIMIT = 5;
 const PREMIUM_HISTORY_LIMIT = 25;
 const PREMIUM_HISTORY_PRICE_LABEL = "5k/bulan";
-const MAX_STORED_HISTORY = PREMIUM_HISTORY_LIMIT;
+const ADMIN_TELEGRAM_USERNAME = "AndiPradanaAr";
+const ADMIN_TELEGRAM_URL = "https://t.me/AndiPradanaAr";
+const HISTORY_PREVIEW_LIMIT = 25;
+const HISTORY_NOTE_MAX_LENGTH = 300;
 const FALLBACK_HISTORY_STORE = new Map();
 const PEOPLE = [
   "andi",
@@ -281,7 +284,8 @@ async function handleTelegramWebhook(request, env) {
   const text = String(message?.text ?? "").trim();
   const parsedCommand = parseTelegramCommand(text);
   const command = parsedCommand.command;
-  const plan = getChatPlan(env, chatId);
+  const actorUsername = getTelegramActorUsername(message);
+  const plan = getChatPlan(env, chatId, actorUsername);
 
   if (!chatId || !command) {
     return json({ ok: true, ignored: true }, 200);
@@ -309,10 +313,90 @@ async function handleTelegramWebhook(request, env) {
     return json({ ok: true, handled: true, command }, 200);
   }
 
+  if (command === "delete") {
+    const reference = resolveMailboxReference(message, parsedCommand.argsText);
+
+    if (!reference.ok) {
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildDeleteUsageMessage(reference.error), {
+        parse_mode: "HTML",
+      });
+
+      return json({ ok: true, handled: true, command, error: reference.error }, 200);
+    }
+
+    const historyState = await deleteHistoryEntry(env, chatId, reference.email, plan);
+
+    if (!historyState.ok) {
+      await sendTelegramMessage(
+        env.TELEGRAM_BOT_TOKEN,
+        chatId,
+        buildDeleteResultMessage(reference.email, historyState),
+        {
+          parse_mode: "HTML",
+          reply_markup: buildHomeKeyboard(historyState),
+        },
+      );
+
+      return json({ ok: true, handled: true, command, error: historyState.error || historyState.code }, 200);
+    }
+
+    await sendTelegramMessage(
+      env.TELEGRAM_BOT_TOKEN,
+      chatId,
+      buildDeleteResultMessage(reference.email, historyState),
+      {
+        parse_mode: "HTML",
+        reply_markup: buildHomeKeyboard(historyState),
+      },
+    );
+
+    return json({ ok: true, handled: true, command, email: reference.email }, 200);
+  }
+
+  if (command === "note") {
+    const noteInput = resolveNoteInput(message, parsedCommand.argsText);
+
+    if (!noteInput.ok) {
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildNoteUsageMessage(noteInput.error), {
+        parse_mode: "HTML",
+      });
+
+      return json({ ok: true, handled: true, command, error: noteInput.error }, 200);
+    }
+
+    const historyState = await updateHistoryNote(env, chatId, noteInput.email, noteInput.note, plan);
+
+    if (!historyState.ok) {
+      await sendTelegramMessage(
+        env.TELEGRAM_BOT_TOKEN,
+        chatId,
+        buildNoteResultMessage(noteInput.email, noteInput.note, historyState),
+        {
+          parse_mode: "HTML",
+          reply_markup: buildHomeKeyboard(historyState),
+        },
+      );
+
+      return json({ ok: true, handled: true, command, error: historyState.error || historyState.code }, 200);
+    }
+
+    await sendTelegramMessage(
+      env.TELEGRAM_BOT_TOKEN,
+      chatId,
+      buildNoteResultMessage(noteInput.email, noteInput.note, historyState),
+      {
+        parse_mode: "HTML",
+        reply_markup: buildMailboxKeyboard(noteInput.localPart, historyState),
+      },
+    );
+
+    return json({ ok: true, handled: true, command, email: noteInput.email }, 200);
+  }
+
   if (command === "new") {
     const historyState = await getHistoryState(env, chatId, plan);
 
-    if (historyState.count >= historyState.limit) {
+    if (isHistoryLimitReached(historyState)) {
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildHistoryLimitMessage(historyState), {
         parse_mode: "HTML",
         reply_markup: buildHomeKeyboard(historyState),
@@ -366,7 +450,7 @@ async function handleTelegramWebhook(request, env) {
 
     const historyState = await getHistoryState(env, chatId, plan);
 
-    if (historyState.count >= historyState.limit && !hasHistoryEmail(historyState, reference.email)) {
+    if (isHistoryLimitReached(historyState) && !hasHistoryEmail(historyState, reference.email)) {
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildHistoryLimitMessage(historyState), {
         parse_mode: "HTML",
         reply_markup: buildHomeKeyboard(historyState),
@@ -460,6 +544,8 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
   const callbackId = callbackQuery?.id;
   const chatId = callbackQuery?.message?.chat?.id;
   const data = String(callbackQuery?.data ?? "");
+  const actorUsername = getTelegramActorUsername(callbackQuery);
+  const plan = getChatPlan(env, chatId, actorUsername);
 
   if (!callbackId || !chatId || !data) {
     return json({ ok: true, ignored: true }, 200);
@@ -467,10 +553,9 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
 
   try {
     if (data === "new") {
-      const plan = getChatPlan(env, chatId);
       const historyState = await getHistoryState(env, chatId, plan);
 
-      if (historyState.count >= historyState.limit) {
+      if (isHistoryLimitReached(historyState)) {
         await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "History penuh.", true);
         await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildHistoryLimitMessage(historyState), {
           parse_mode: "HTML",
@@ -521,7 +606,6 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
     }
 
     if (data === "history") {
-      const plan = getChatPlan(env, chatId);
       const historyState = await getHistoryState(env, chatId, plan);
 
       await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "History ditampilkan.");
@@ -534,7 +618,6 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
     }
 
     if (data === "buy_history") {
-      const plan = getChatPlan(env, chatId);
       const historyState = await getHistoryState(env, chatId, plan);
 
       await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Info pembelian dikirim.");
@@ -556,6 +639,38 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
       return json({ ok: true, handled: true, callback: data, error: mailbox.error }, 200);
     }
 
+    if (action === "delete") {
+      const historyState = await deleteHistoryEntry(env, chatId, mailbox.email, plan);
+
+      if (!historyState.ok) {
+        await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Hapus history gagal.", true);
+        await sendTelegramMessage(
+          env.TELEGRAM_BOT_TOKEN,
+          chatId,
+          buildDeleteResultMessage(mailbox.email, historyState),
+          {
+            parse_mode: "HTML",
+            reply_markup: buildHomeKeyboard(historyState),
+          },
+        );
+
+        return json({ ok: true, handled: true, callback: data, error: historyState.error || historyState.code }, 200);
+      }
+
+      await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "History email dihapus.");
+      await sendTelegramMessage(
+        env.TELEGRAM_BOT_TOKEN,
+        chatId,
+        buildDeleteResultMessage(mailbox.email, historyState),
+        {
+          parse_mode: "HTML",
+          reply_markup: buildHomeKeyboard(historyState),
+        },
+      );
+
+      return json({ ok: true, handled: true, callback: data, email: mailbox.email }, 200);
+    }
+
     if (action !== "inbox" && action !== "refresh") {
       await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Aksi tidak dikenal.", true);
       return json({ ok: true, handled: true, callback: data }, 200);
@@ -575,7 +690,7 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
       return json({ ok: false, handled: true, callback: data, error: inboxResult.error }, 502);
     }
 
-    const historyState = await getHistoryState(env, chatId, getChatPlan(env, chatId));
+    const historyState = await getHistoryState(env, chatId, plan);
 
     await answerTelegramCallbackQuery(
       env.TELEGRAM_BOT_TOKEN,
@@ -641,7 +756,9 @@ async function getMailboxInbox(request, localPart) {
     }
 
     const messages = Array.isArray(listResponse.data?.list)
-      ? listResponse.data.list.map((item) => normalizeMailboxMessage(item))
+      ? listResponse.data.list
+          .map((item) => normalizeMailboxMessage(item))
+          .filter((item) => !isSystemMailboxMessage(item))
       : [];
 
     return {
@@ -793,13 +910,16 @@ function randomInt(max) {
   return array[0] % max;
 }
 
-function getChatPlan(env, chatId) {
+function getChatPlan(env, chatId, username = "") {
   const premiumChatIds = parsePremiumChatIds(env?.PREMIUM_CHAT_IDS);
-  const isPremium = premiumChatIds.has(String(chatId ?? ""));
+  const isAdmin = normalizeTelegramUsername(username) === normalizeTelegramUsername(ADMIN_TELEGRAM_USERNAME);
+  const isPremium = isAdmin || premiumChatIds.has(String(chatId ?? ""));
 
   return {
+    isAdmin,
     isPremium,
-    limit: isPremium ? PREMIUM_HISTORY_LIMIT : DEFAULT_HISTORY_LIMIT,
+    isUnlimited: isAdmin,
+    limit: isAdmin ? null : isPremium ? PREMIUM_HISTORY_LIMIT : DEFAULT_HISTORY_LIMIT,
     upgradePriceLabel: PREMIUM_HISTORY_PRICE_LABEL,
   };
 }
@@ -821,6 +941,7 @@ async function getHistoryState(env, chatId, plan = getChatPlan(env, chatId)) {
   const result = await invokeHistoryStore(env, chatId, "/state", {
     limit: plan.limit,
     isPremium: plan.isPremium,
+    isUnlimited: plan.isUnlimited,
   });
 
   return normalizeHistoryState(result, plan);
@@ -833,6 +954,44 @@ async function recordHistoryEntry(env, chatId, payload, source, plan = getChatPl
     source,
     limit: plan.limit,
     isPremium: plan.isPremium,
+    isUnlimited: plan.isUnlimited,
+  });
+
+  return normalizeHistoryState(result, plan);
+}
+
+async function deleteHistoryEntry(env, chatId, email, plan = getChatPlan(env, chatId)) {
+  const reference = parseMailboxReference(email);
+
+  if (!reference.ok) {
+    return normalizeHistoryState(
+      { ok: false, error: reference.error, items: [] },
+      plan,
+    );
+  }
+
+  const result = await invokeHistoryStore(env, chatId, "/delete", {
+    email: reference.email,
+    localPart: reference.localPart,
+  });
+
+  return normalizeHistoryState(result, plan);
+}
+
+async function updateHistoryNote(env, chatId, email, note, plan = getChatPlan(env, chatId)) {
+  const reference = parseMailboxReference(email);
+
+  if (!reference.ok) {
+    return normalizeHistoryState(
+      { ok: false, error: reference.error, items: [] },
+      plan,
+    );
+  }
+
+  const result = await invokeHistoryStore(env, chatId, "/note", {
+    email: reference.email,
+    localPart: reference.localPart,
+    note,
   });
 
   return normalizeHistoryState(result, plan);
@@ -868,6 +1027,81 @@ function fallbackHistoryStoreFetch(chatId, path, payload) {
     };
   }
 
+  if (path === "/delete") {
+    const reference = parseMailboxReference(payload?.email || payload?.localPart);
+
+    if (!reference.ok) {
+      return {
+        ok: false,
+        error: reference.error,
+        items: existing,
+        count: existing.length,
+      };
+    }
+
+    const nextItems = existing.filter(
+      (item) => item.localPart !== reference.localPart && item.email !== reference.email,
+    );
+
+    if (nextItems.length === existing.length) {
+      return {
+        ok: false,
+        code: "not_found",
+        items: existing,
+        count: existing.length,
+      };
+    }
+
+    FALLBACK_HISTORY_STORE.set(key, nextItems);
+
+    return {
+      ok: true,
+      items: nextItems,
+      count: nextItems.length,
+    };
+  }
+
+  if (path === "/note") {
+    const reference = parseMailboxReference(payload?.email || payload?.localPart);
+    const note = normalizeHistoryNote(payload?.note);
+
+    if (!reference.ok) {
+      return {
+        ok: false,
+        error: reference.error,
+        items: existing,
+        count: existing.length,
+      };
+    }
+
+    const nextItems = [...existing];
+    const index = nextItems.findIndex(
+      (item) => item.localPart === reference.localPart || item.email === reference.email,
+    );
+
+    if (index < 0) {
+      return {
+        ok: false,
+        code: "not_found",
+        items: existing,
+        count: existing.length,
+      };
+    }
+
+    nextItems[index] = {
+      ...nextItems[index],
+      note,
+      updatedAt: Date.now(),
+    };
+    FALLBACK_HISTORY_STORE.set(key, nextItems);
+
+    return {
+      ok: true,
+      items: nextItems,
+      count: nextItems.length,
+    };
+  }
+
   if (path !== "/record") {
     return {
       ok: false,
@@ -879,7 +1113,10 @@ function fallbackHistoryStoreFetch(chatId, path, payload) {
 
   const localPart = normalizeLocalPart(payload?.localPart);
   const email = formatHistoryEmail(payload?.email, localPart);
-  const limit = normalizeHistoryLimit(payload?.limit, Boolean(payload?.isPremium));
+  const limit = normalizeHistoryLimit(payload?.limit, {
+    isPremium: Boolean(payload?.isPremium),
+    isUnlimited: Boolean(payload?.isUnlimited),
+  });
 
   if (!localPart || !email) {
     return {
@@ -899,10 +1136,11 @@ function fallbackHistoryStoreFetch(chatId, path, payload) {
       ...current,
       email,
       localPart,
+      note: normalizeHistoryNote(current.note),
       source: normalizeHistorySource(payload?.source, current.source),
       updatedAt: Date.now(),
     });
-    FALLBACK_HISTORY_STORE.set(key, updated.slice(0, MAX_STORED_HISTORY));
+    FALLBACK_HISTORY_STORE.set(key, updated);
 
     return {
       ok: true,
@@ -911,7 +1149,7 @@ function fallbackHistoryStoreFetch(chatId, path, payload) {
     };
   }
 
-  if (updated.length >= limit) {
+  if (limit !== null && updated.length >= limit) {
     return {
       ok: false,
       code: "limit_reached",
@@ -923,11 +1161,12 @@ function fallbackHistoryStoreFetch(chatId, path, payload) {
   updated.unshift({
     email,
     localPart,
+    note: "",
     source: normalizeHistorySource(payload?.source),
     createdAt: Date.now(),
     updatedAt: Date.now(),
   });
-  FALLBACK_HISTORY_STORE.set(key, updated.slice(0, MAX_STORED_HISTORY));
+  FALLBACK_HISTORY_STORE.set(key, updated);
 
   return {
     ok: true,
@@ -947,6 +1186,8 @@ function normalizeHistoryState(result, plan) {
     count: items.length,
     limit: plan.limit,
     isPremium: plan.isPremium,
+    isAdmin: plan.isAdmin,
+    isUnlimited: plan.isUnlimited,
     upgradePriceLabel: plan.upgradePriceLabel,
   };
 }
@@ -968,13 +1209,13 @@ function normalizeStoredHistory(items) {
       return {
         email,
         localPart,
+        note: normalizeHistoryNote(item?.note),
         source: normalizeHistorySource(item?.source),
         createdAt: Number(item?.createdAt || 0),
         updatedAt: Number(item?.updatedAt || 0),
       };
     })
-    .filter(Boolean)
-    .slice(0, MAX_STORED_HISTORY);
+    .filter(Boolean);
 }
 
 function normalizeHistorySource(value, fallback = "generated") {
@@ -982,8 +1223,12 @@ function normalizeHistorySource(value, fallback = "generated") {
   return normalized === "imported" ? "imported" : "generated";
 }
 
-function normalizeHistoryLimit(value, isPremium = false) {
-  const fallback = isPremium ? PREMIUM_HISTORY_LIMIT : DEFAULT_HISTORY_LIMIT;
+function normalizeHistoryLimit(value, options = {}) {
+  if (options.isUnlimited) {
+    return null;
+  }
+
+  const fallback = options.isPremium ? PREMIUM_HISTORY_LIMIT : DEFAULT_HISTORY_LIMIT;
   const parsed = Number.parseInt(String(value ?? fallback), 10);
 
   if (!Number.isFinite(parsed)) {
@@ -991,6 +1236,10 @@ function normalizeHistoryLimit(value, isPremium = false) {
   }
 
   return Math.min(PREMIUM_HISTORY_LIMIT, Math.max(DEFAULT_HISTORY_LIMIT, parsed));
+}
+
+function normalizeHistoryNote(value) {
+  return trimText(String(value ?? "").trim().replace(/\s+/g, " "), HISTORY_NOTE_MAX_LENGTH);
 }
 
 function formatHistoryEmail(email, localPart) {
@@ -1028,17 +1277,47 @@ function parseTelegramCommand(text) {
   };
 }
 
+function getTelegramActorUsername(entity) {
+  return normalizeTelegramUsername(entity?.from?.username || entity?.chat?.username);
+}
+
+function normalizeTelegramUsername(value) {
+  return String(value ?? "")
+    .trim()
+    .replace(/^@+/, "")
+    .toLowerCase();
+}
+
+function formatPlanName(historyState) {
+  if (historyState.isAdmin) {
+    return "Admin";
+  }
+
+  return historyState.isPremium ? "Premium" : "Basic";
+}
+
+function formatHistoryUsage(historyState) {
+  const limit = historyState.isUnlimited ? "Unlimited" : String(historyState.limit ?? DEFAULT_HISTORY_LIMIT);
+  return `${historyState.count}/${limit}`;
+}
+
+function isHistoryLimitReached(historyState) {
+  return historyState.limit !== null && historyState.limit !== undefined && historyState.count >= historyState.limit;
+}
+
 function buildStartMessage(historyState) {
   return [
     "<b>TempMGen siap dipakai</b>",
     "",
     `Domain tetap: <code>@${FIXED_DOMAIN}</code>`,
     "Pola nama: <code>nama + benda + kota + angka 0-99</code>",
-    `History: <code>${escapeHtml(String(historyState.count))}/${escapeHtml(String(historyState.limit))}</code>`,
-    `Paket: <code>${historyState.isPremium ? "Premium" : "Basic"}</code>`,
+    `History: <code>${escapeHtml(formatHistoryUsage(historyState))}</code>`,
+    `Paket: <code>${escapeHtml(formatPlanName(historyState))}</code>`,
     "",
     "Perintah:",
     "<code>/new</code> - generate email baru",
+    "<code>/delete email@pokemail.net</code> - hapus 1 email dari history",
+    "<code>/note email@pokemail.net catatan</code> - simpan catatan email",
     "<code>/inbox email@pokemail.net</code> - lihat inbox",
     "<code>/refresh email@pokemail.net</code> - refresh inbox",
     "<code>/import email@pokemail.net</code> - reuse atau recovery email",
@@ -1052,7 +1331,7 @@ function buildNewEmailMessage(payload, historyState) {
     "<b>Email baru berhasil dibuat</b>",
     "",
     `<code>${escapeHtml(payload.email)}</code>`,
-    `History: <code>${escapeHtml(String(historyState.count))}/${escapeHtml(String(historyState.limit))}</code>`,
+    `History: <code>${escapeHtml(formatHistoryUsage(historyState))}</code>`,
     "",
     "Komposisi:",
     `- nama: <code>${escapeHtml(payload.parts.person)}</code>`,
@@ -1070,18 +1349,19 @@ function buildImportSuccessMessage(payload, historyState) {
     "",
     `<code>${escapeHtml(payload.email)}</code>`,
     `Pesan terdeteksi: <code>${escapeHtml(String(payload.messageCount))}</code>`,
-    `History: <code>${escapeHtml(String(historyState.count))}/${escapeHtml(String(historyState.limit))}</code>`,
+    `History: <code>${escapeHtml(formatHistoryUsage(historyState))}</code>`,
     "",
     "Gunakan tombol di bawah untuk buka atau refresh inbox.",
   ].join("\n");
 }
 
 function buildHistoryMessage(historyState) {
+  const previewItems = historyState.items.slice(0, HISTORY_PREVIEW_LIMIT);
   const lines = [
     "<b>History email</b>",
     "",
-    `Paket: <code>${historyState.isPremium ? "Premium" : "Basic"}</code>`,
-    `Terpakai: <code>${escapeHtml(String(historyState.count))}/${escapeHtml(String(historyState.limit))}</code>`,
+    `Paket: <code>${escapeHtml(formatPlanName(historyState))}</code>`,
+    `Terpakai: <code>${escapeHtml(formatHistoryUsage(historyState))}</code>`,
   ];
 
   if (!historyState.items.length) {
@@ -1091,11 +1371,25 @@ function buildHistoryMessage(historyState) {
 
   lines.push("", "Daftar email:");
 
-  for (const [index, item] of historyState.items.entries()) {
+  for (const [index, item] of previewItems.entries()) {
     lines.push(`${index + 1}. <code>${escapeHtml(item.email)}</code>`);
+    lines.push(`   sumber: <code>${escapeHtml(item.source)}</code>`);
+
+    if (item.note) {
+      lines.push(`   catatan: ${escapeHtml(item.note)}`);
+    }
   }
 
-  lines.push("", "Gunakan <code>/import email@pokemail.net</code> untuk recovery email tertentu.");
+  if (historyState.items.length > previewItems.length) {
+    lines.push("", `Dan ${escapeHtml(String(historyState.items.length - previewItems.length))} email lainnya.`);
+  }
+
+  lines.push(
+    "",
+    "Gunakan <code>/import email@pokemail.net</code> untuk recovery email tertentu.",
+    "Gunakan <code>/delete email@pokemail.net</code> untuk hapus history 1 email.",
+    "Gunakan <code>/note email@pokemail.net catatan</code> untuk menambah catatan.",
+  );
 
   return lines.join("\n");
 }
@@ -1104,8 +1398,13 @@ function buildHistoryLimitMessage(historyState) {
   const lines = [
     "<b>History email sudah penuh</b>",
     "",
-    `Terpakai: <code>${escapeHtml(String(historyState.count))}/${escapeHtml(String(historyState.limit))}</code>`,
+    `Terpakai: <code>${escapeHtml(formatHistoryUsage(historyState))}</code>`,
   ];
+
+  if (historyState.isUnlimited) {
+    lines.push("", "Akun admin tidak punya batas history.");
+    return lines.join("\n");
+  }
 
   if (historyState.isPremium) {
     lines.push("", "Limit premium kamu sudah penuh. Gunakan email yang ada di history atau lakukan import email lama.");
@@ -1128,11 +1427,94 @@ function buildBuyHistoryMessage(chatId, historyState) {
     `Harga: <code>${escapeHtml(historyState.upgradePriceLabel)}</code>`,
     `Limit: <code>${DEFAULT_HISTORY_LIMIT}</code> -> <code>${PREMIUM_HISTORY_LIMIT}</code> history email`,
     "",
+    `Hubungi <a href="${ADMIN_TELEGRAM_URL}">@${escapeHtml(ADMIN_TELEGRAM_USERNAME)}</a> untuk pembelian premium.`,
     "Kirim Chat ID ini ke admin untuk aktivasi premium:",
     `<code>${escapeHtml(String(chatId))}</code>`,
     "",
-    "Setelah pembayaran aktif, admin bisa menambahkan Chat ID kamu ke daftar premium.",
+    "Setelah pembayaran aktif, history kamu akan naik jadi 25 email.",
   ].join("\n");
+}
+
+function buildDeleteResultMessage(email, historyState) {
+  if (historyState.ok) {
+    return [
+      "<b>History email dihapus</b>",
+      "",
+      `<code>${escapeHtml(email)}</code>`,
+      `Sisa history: <code>${escapeHtml(formatHistoryUsage(historyState))}</code>`,
+    ].join("\n");
+  }
+
+  if (historyState.code === "not_found") {
+    return [
+      "<b>Email tidak ada di history</b>",
+      "",
+      `<code>${escapeHtml(email)}</code>`,
+      "Gunakan <code>/history</code> untuk lihat email yang tersimpan.",
+    ].join("\n");
+  }
+
+  return [
+    "<b>Gagal menghapus history</b>",
+    "",
+    escapeHtml(historyState.error || "Terjadi kesalahan."),
+  ].join("\n");
+}
+
+function buildDeleteUsageMessage(error) {
+  return [
+    "<b>Cara hapus history email</b>",
+    "",
+    error ? escapeHtml(error) : "",
+    "",
+    "Contoh:",
+    `<code>/delete andipakukediri99@${FIXED_DOMAIN}</code>`,
+    `<code>/delete andipakukediri99</code>`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function buildNoteResultMessage(email, note, historyState) {
+  if (historyState.ok) {
+    return [
+      "<b>Catatan email disimpan</b>",
+      "",
+      `<code>${escapeHtml(email)}</code>`,
+      `Catatan: ${escapeHtml(note)}`,
+      `History: <code>${escapeHtml(formatHistoryUsage(historyState))}</code>`,
+    ].join("\n");
+  }
+
+  if (historyState.code === "not_found") {
+    return [
+      "<b>Email tidak ada di history</b>",
+      "",
+      `<code>${escapeHtml(email)}</code>`,
+      "Generate atau import email itu dulu sebelum menambah catatan.",
+    ].join("\n");
+  }
+
+  return [
+    "<b>Gagal menyimpan catatan</b>",
+    "",
+    escapeHtml(historyState.error || "Terjadi kesalahan."),
+  ].join("\n");
+}
+
+function buildNoteUsageMessage(error) {
+  return [
+    "<b>Cara menambah catatan email</b>",
+    "",
+    error ? escapeHtml(error) : "",
+    "",
+    "Contoh:",
+    `<code>/note andipakukediri99@${FIXED_DOMAIN} akun marketplace</code>`,
+    "Atau reply ke pesan email bot dengan:",
+    "<code>/note akun marketplace</code>",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function buildInboxMessage(payload, options = {}) {
@@ -1203,6 +1585,8 @@ function buildUnknownCommandMessage() {
     "<code>/start</code>",
     "<code>/new</code>",
     "<code>/history</code>",
+    "<code>/delete email@pokemail.net</code>",
+    "<code>/note email@pokemail.net catatan</code>",
     "<code>/inbox email@pokemail.net</code>",
     "<code>/refresh email@pokemail.net</code>",
     "<code>/import email@pokemail.net</code>",
@@ -1217,8 +1601,8 @@ function buildHomeKeyboard(historyState) {
     ],
   ];
 
-  if (!historyState.isPremium) {
-    rows.push([{ text: "Pembelian 5k/bulan", callback_data: "buy_history" }]);
+  if (!historyState.isPremium && !historyState.isAdmin) {
+    rows.push([{ text: "Pembelian 5k/bulan", url: ADMIN_TELEGRAM_URL }]);
   }
 
   return { inline_keyboard: rows };
@@ -1234,10 +1618,11 @@ function buildMailboxKeyboard(localPart, historyState) {
       { text: "History", callback_data: "history" },
       { text: "New Email", callback_data: "new" },
     ],
+    [{ text: "Hapus History Email", callback_data: `delete:${localPart}` }],
   ];
 
-  if (!historyState.isPremium) {
-    rows.push([{ text: "Pembelian 5k/bulan", callback_data: "buy_history" }]);
+  if (!historyState.isPremium && !historyState.isAdmin) {
+    rows.push([{ text: "Pembelian 5k/bulan", url: ADMIN_TELEGRAM_URL }]);
   }
 
   return { inline_keyboard: rows };
@@ -1337,6 +1722,85 @@ function resolveMailboxReference(message, argsText) {
   };
 }
 
+function resolveNoteInput(message, argsText) {
+  const raw = String(argsText ?? "").trim();
+
+  if (!raw) {
+    return {
+      ok: false,
+      error: "Catatan belum diisi.",
+    };
+  }
+
+  const hasReplyReference = resolveMailboxReference(message, "").ok;
+  const startsWithExplicitEmail = /@pokemail\.net\b/i.test(raw);
+
+  if (hasReplyReference && !startsWithExplicitEmail) {
+    const replyReference = resolveMailboxReference(message, "");
+    const note = normalizeHistoryNote(raw);
+
+    if (!note) {
+      return {
+        ok: false,
+        error: "Catatan belum diisi.",
+      };
+    }
+
+    return {
+      ok: true,
+      email: replyReference.email,
+      localPart: replyReference.localPart,
+      note,
+    };
+  }
+
+  const firstToken = raw.split(/\s+/)[0] || "";
+  const directReference = parseMailboxReference(firstToken);
+
+  if (directReference.ok) {
+    const note = normalizeHistoryNote(raw.slice(firstToken.length).trim());
+
+    if (!note) {
+      return {
+        ok: false,
+        error: "Catatan belum diisi.",
+      };
+    }
+
+    return {
+      ok: true,
+      email: directReference.email,
+      localPart: directReference.localPart,
+      note,
+    };
+  }
+
+  const replyReference = resolveMailboxReference(message, "");
+
+  if (!replyReference.ok) {
+    return {
+      ok: false,
+      error: "Balas pesan email bot atau sertakan email target di command.",
+    };
+  }
+
+  const note = normalizeHistoryNote(raw);
+
+  if (!note) {
+    return {
+      ok: false,
+      error: "Catatan belum diisi.",
+    };
+  }
+
+  return {
+    ok: true,
+    email: replyReference.email,
+    localPart: replyReference.localPart,
+    note,
+  };
+}
+
 function parseMailboxReference(text) {
   const raw = String(text ?? "").trim().toLowerCase();
 
@@ -1378,6 +1842,13 @@ function normalizeMailboxMessage(item) {
     excerpt: trimText(decodeHtmlEntities(String(item?.mail_excerpt ?? "")).replace(/\s+/g, " "), 180),
     date: String(item?.mail_date ?? "").trim(),
   };
+}
+
+function isSystemMailboxMessage(item) {
+  const from = String(item?.from ?? "").trim().toLowerCase();
+  const subject = String(item?.subject ?? "").trim().toLowerCase();
+
+  return from === "no-reply@guerrillamail.com" && subject === "welcome to guerrilla mail";
 }
 
 function decodeHtmlEntities(value) {
@@ -1460,11 +1931,109 @@ export class TempMGenState {
       );
     }
 
+    if (url.pathname === "/delete") {
+      const items = await this.readHistory();
+      const reference = parseMailboxReference(body?.email || body?.localPart);
+
+      if (!reference.ok) {
+        return json(
+          {
+            ok: false,
+            error: reference.error,
+            items,
+            count: items.length,
+          },
+          200,
+        );
+      }
+
+      const nextItems = items.filter(
+        (item) => item.localPart !== reference.localPart && item.email !== reference.email,
+      );
+
+      if (nextItems.length === items.length) {
+        return json(
+          {
+            ok: false,
+            code: "not_found",
+            items,
+            count: items.length,
+          },
+          200,
+        );
+      }
+
+      await this.writeHistory(nextItems);
+
+      return json(
+        {
+          ok: true,
+          items: nextItems,
+          count: nextItems.length,
+        },
+        200,
+      );
+    }
+
+    if (url.pathname === "/note") {
+      const items = await this.readHistory();
+      const reference = parseMailboxReference(body?.email || body?.localPart);
+      const note = normalizeHistoryNote(body?.note);
+
+      if (!reference.ok) {
+        return json(
+          {
+            ok: false,
+            error: reference.error,
+            items,
+            count: items.length,
+          },
+          200,
+        );
+      }
+
+      const nextItems = [...items];
+      const existingIndex = nextItems.findIndex(
+        (item) => item.localPart === reference.localPart || item.email === reference.email,
+      );
+
+      if (existingIndex < 0) {
+        return json(
+          {
+            ok: false,
+            code: "not_found",
+            items,
+            count: items.length,
+          },
+          200,
+        );
+      }
+
+      nextItems[existingIndex] = {
+        ...nextItems[existingIndex],
+        note,
+        updatedAt: Date.now(),
+      };
+      await this.writeHistory(nextItems);
+
+      return json(
+        {
+          ok: true,
+          items: nextItems,
+          count: nextItems.length,
+        },
+        200,
+      );
+    }
+
     if (url.pathname === "/record") {
       const items = await this.readHistory();
       const localPart = normalizeLocalPart(body?.localPart);
       const email = formatHistoryEmail(body?.email, localPart);
-      const limit = normalizeHistoryLimit(body?.limit, Boolean(body?.isPremium));
+      const limit = normalizeHistoryLimit(body?.limit, {
+        isPremium: Boolean(body?.isPremium),
+        isUnlimited: Boolean(body?.isUnlimited),
+      });
 
       if (!localPart || !email) {
         return json(
@@ -1489,6 +2058,7 @@ export class TempMGenState {
           ...current,
           email,
           localPart,
+          note: normalizeHistoryNote(current.note),
           source: normalizeHistorySource(body?.source, current.source),
           updatedAt: Date.now(),
         });
@@ -1504,7 +2074,7 @@ export class TempMGenState {
         );
       }
 
-      if (nextItems.length >= limit) {
+      if (limit !== null && nextItems.length >= limit) {
         return json(
           {
             ok: false,
@@ -1519,6 +2089,7 @@ export class TempMGenState {
       nextItems.unshift({
         email,
         localPart,
+        note: "",
         source: normalizeHistorySource(body?.source),
         createdAt: Date.now(),
         updatedAt: Date.now(),

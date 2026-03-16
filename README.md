@@ -6,8 +6,8 @@ Web app sederhana untuk:
 - kunci domain output ke `@pokemail.net`
 - pakai session Guerrilla Mail di balik Worker
 - terima update Telegram lewat webhook Worker
-- sediakan command bot `/start`, `/new`, `/history`, `/inbox`, `/refresh`, dan `/import`
-- simpan history email Telegram dengan batas default 5 dan premium 25
+- sediakan command bot `/start`, `/new`, `/history`, `/delete`, `/note`, `/inbox`, `/refresh`, dan `/import`
+- simpan history email Telegram dengan batas default 5, premium 25, dan admin unlimited
 
 ## Stack
 
@@ -44,6 +44,8 @@ Command yang sudah aktif:
 - `/start`
 - `/new`
 - `/history`
+- `/delete`
+- `/note`
 - `/inbox`
 - `/refresh`
 - `/import`
@@ -79,17 +81,21 @@ curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<w
 - `/start` menampilkan bantuan bot
 - `/new` membuat email baru seperti `andipakukediri99@pokemail.net`
 - `/history` menampilkan history email user
+- `/delete email@pokemail.net` menghapus 1 email dari history
+- `/note email@pokemail.net catatan` menambah catatan untuk email tertentu
 - `/inbox email@pokemail.net` membuka inbox email itu
 - `/refresh email@pokemail.net` mengambil inbox terbaru untuk email itu
 - `/import email@pokemail.net` memulihkan email lama agar bisa dipakai lagi di bot
-- tombol inline `Inbox`, `Refresh`, `History`, dan `Pembelian 5k/bulan` ikut dikirim di pesan bot
+- tombol inline `Inbox`, `Refresh`, `History`, `Hapus History Email`, dan `Pembelian 5k/bulan` ikut dikirim di pesan bot
 
 ### History email
 
 - limit default: `5` email per chat Telegram
 - limit premium: `25` email per chat Telegram
+- akun admin `@AndiPradanaAr` otomatis `unlimited history`
 - saat history penuh, bot menolak generate/import email baru dan menampilkan pesan error
-- tombol `Pembelian 5k/bulan` menampilkan info upgrade untuk menaikkan history dari 5 ke 25
+- tombol `Pembelian 5k/bulan` langsung diarahkan ke `https://t.me/AndiPradanaAr`
+- setiap email history bisa punya catatan sendiri
 
 Cloudflare Durable Object dipakai untuk menyimpan history email per chat.
 
@@ -151,6 +157,11 @@ npx wrangler secret put PREMIUM_CHAT_IDS
 ```
 
 Isi `PREMIUM_CHAT_IDS` dengan daftar chat ID premium dipisah koma atau baris baru.
+
+Catatan admin:
+
+- user Telegram dengan username `@AndiPradanaAr` otomatis dianggap admin
+- admin tidak perlu subscribe dan limit history-nya unlimited
 
 Kalau nanti kamu mau sinkronkan secret Telegram lewat GitHub Actions juga, saya bisa tambahkan step khusus setelah kamu menyiapkan secret GitHub `TELEGRAM_BOT_TOKEN`.
 
