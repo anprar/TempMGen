@@ -9,6 +9,7 @@ const ADMIN_TELEGRAM_URL = "https://t.me/AndiPradanaAr";
 const HISTORY_PREVIEW_LIMIT = 25;
 const HISTORY_NOTE_MAX_LENGTH = 300;
 const FALLBACK_HISTORY_STORE = new Map();
+const FALLBACK_PENDING_STORE = new Map();
 const SUPPORTED_EMAIL_DOMAINS = [
   "sharklasers.com",
   "guerrillamail.info",
@@ -365,8 +366,17 @@ async function handleTelegramWebhook(request, env) {
   const command = parsedCommand.command;
   const actorUsername = getTelegramActorUsername(message);
   const plan = getChatPlan(env, chatId, actorUsername);
+  const pendingAction = await getPendingAction(env, chatId);
 
-  if (!chatId || !command) {
+  if (!chatId) {
+    return json({ ok: true, ignored: true }, 200);
+  }
+
+  if (!command && pendingAction && text) {
+    return handlePendingTelegramInput(request, env, message, text, pendingAction, plan);
+  }
+
+  if (!command) {
     return json({ ok: true, ignored: true }, 200);
   }
 
@@ -386,7 +396,7 @@ async function handleTelegramWebhook(request, env) {
 
     await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildHistoryMessage(historyState), {
       parse_mode: "HTML",
-      reply_markup: buildHomeKeyboard(historyState),
+      reply_markup: buildHistorySelectorKeyboard(historyState, 0),
     });
 
     return json({ ok: true, handled: true, command }, 200);
@@ -695,31 +705,36 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
       await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "History ditampilkan.");
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildHistoryMessage(historyState), {
         parse_mode: "HTML",
-        reply_markup: buildHomeKeyboard(historyState),
+        reply_markup: buildHistorySelectorKeyboard(historyState, 0),
       });
 
       return json({ ok: true, handled: true, callback: data }, 200);
     }
 
-    if (data === "import_help") {
+    if (data === "history_select:0" || data.startsWith("history_select:")) {
       const historyState = await getHistoryState(env, chatId, plan);
+      const page = Number.parseInt(data.split(":")[1] || "0", 10) || 0;
 
-      await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Cara import dikirim.");
-      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildImportUsageMessage(""), {
+      await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Pilih email dari history.");
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildHistorySelectorMessage(historyState, page), {
         parse_mode: "HTML",
-        reply_markup: buildHomeKeyboard(historyState),
+        reply_markup: buildHistorySelectorKeyboard(historyState, page),
       });
 
       return json({ ok: true, handled: true, callback: data }, 200);
     }
 
-    if (data === "delete_help") {
+    if (data === "import_prompt") {
       const historyState = await getHistoryState(env, chatId, plan);
 
-      await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Cara hapus dikirim.");
-      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildDeleteUsageMessage(""), {
+      await setPendingAction(env, chatId, { type: "import" });
+      await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Kirim email yang ingin diimport.");
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildImportPromptMessage(), {
         parse_mode: "HTML",
         reply_markup: buildHomeKeyboard(historyState),
+        reply_parameters: callbackQuery?.message?.message_id
+          ? { message_id: callbackQuery.message.message_id }
+          : undefined,
       });
 
       return json({ ok: true, handled: true, callback: data }, 200);
@@ -741,6 +756,9 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
     const action = separator >= 0 ? data.slice(0, separator) : data;
     const rawLocalPart = separator >= 0 ? data.slice(separator + 1) : "";
     const mailbox = parseMailboxReference(rawLocalPart);
+    const historyState = await getHistoryState(env, chatId, plan);
+    const historyEntry = mailbox.ok ? findHistoryEntry(historyState, mailbox.email || mailbox.localPart) : null;
+    const targetEmail = historyEntry?.email || mailbox.email;
 
     if (!mailbox.ok || !rawLocalPart) {
       await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Email tidak valid.", true);
@@ -748,35 +766,53 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
     }
 
     if (action === "delete") {
-      const historyState = await deleteHistoryEntry(env, chatId, mailbox.email, plan);
+      const nextHistoryState = await deleteHistoryEntry(env, chatId, targetEmail, plan);
 
-      if (!historyState.ok) {
+      if (!nextHistoryState.ok) {
         await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Hapus history gagal.", true);
         await sendTelegramMessage(
           env.TELEGRAM_BOT_TOKEN,
           chatId,
-          buildDeleteResultMessage(mailbox.email, historyState),
+          buildDeleteResultMessage(targetEmail, nextHistoryState),
           {
             parse_mode: "HTML",
-            reply_markup: buildHomeKeyboard(historyState),
+            reply_markup: buildHomeKeyboard(nextHistoryState),
           },
         );
 
-        return json({ ok: true, handled: true, callback: data, error: historyState.error || historyState.code }, 200);
+        return json({ ok: true, handled: true, callback: data, error: nextHistoryState.error || nextHistoryState.code }, 200);
       }
 
       await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "History email dihapus.");
       await sendTelegramMessage(
         env.TELEGRAM_BOT_TOKEN,
         chatId,
-        buildDeleteResultMessage(mailbox.email, historyState),
+        buildDeleteResultMessage(targetEmail, nextHistoryState),
         {
           parse_mode: "HTML",
-          reply_markup: buildHomeKeyboard(historyState),
+          reply_markup: buildHomeKeyboard(nextHistoryState),
         },
       );
 
-      return json({ ok: true, handled: true, callback: data, email: mailbox.email }, 200);
+      return json({ ok: true, handled: true, callback: data, email: targetEmail }, 200);
+    }
+
+    if (action === "note_prompt") {
+      await setPendingAction(env, chatId, {
+        type: "note",
+        email: targetEmail,
+        localPart: mailbox.localPart,
+      });
+      await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Kirim catatan untuk email ini.");
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildNotePromptMessage(targetEmail), {
+        parse_mode: "HTML",
+        reply_markup: buildMailboxKeyboard(mailbox.localPart, historyState),
+        reply_parameters: callbackQuery?.message?.message_id
+          ? { message_id: callbackQuery.message.message_id }
+          : undefined,
+      });
+
+      return json({ ok: true, handled: true, callback: data, email: targetEmail }, 200);
     }
 
     if (action !== "inbox" && action !== "refresh") {
@@ -784,10 +820,8 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
       return json({ ok: true, handled: true, callback: data }, 200);
     }
 
-    const historyState = await getHistoryState(env, chatId, plan);
-    const historyEntry = findHistoryEntry(historyState, mailbox.email || mailbox.localPart);
     const inboxResult = await getMailboxInbox(request, mailbox.localPart, {
-      displayEmail: historyEntry?.email || mailbox.email,
+      displayEmail: targetEmail,
       historyEntry,
     });
 
@@ -823,6 +857,96 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
     await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Terjadi error.", true);
     throw error;
   }
+}
+
+async function handlePendingTelegramInput(request, env, message, text, pendingAction, plan) {
+  const chatId = message?.chat?.id;
+
+  if (!chatId) {
+    return json({ ok: true, ignored: true }, 200);
+  }
+
+  await clearPendingAction(env, chatId);
+
+  if (pendingAction.type === "import") {
+    const reference = parseMailboxReference(text);
+
+    if (!reference.ok) {
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildImportUsageMessage(reference.error), {
+        parse_mode: "HTML",
+      });
+
+      return json({ ok: true, handled: true, pending: pendingAction.type, error: reference.error }, 200);
+    }
+
+    const historyState = await getHistoryState(env, chatId, plan);
+
+    if (isHistoryLimitReached(historyState) && !hasHistoryEmail(historyState, reference.email)) {
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildHistoryLimitMessage(historyState), {
+        parse_mode: "HTML",
+        reply_markup: buildHomeKeyboard(historyState),
+      });
+
+      return json({ ok: true, handled: true, pending: pendingAction.type, error: "History limit reached" }, 200);
+    }
+
+    const inboxResult = await getMailboxInbox(request, reference.localPart, {
+      displayEmail: reference.email,
+    });
+
+    if (!inboxResult.ok) {
+      await sendTelegramMessage(
+        env.TELEGRAM_BOT_TOKEN,
+        chatId,
+        `Gagal import email.\n\n${escapeHtml(inboxResult.error)}`,
+        { parse_mode: "HTML" },
+      );
+
+      return json({ ok: false, handled: true, pending: pendingAction.type, error: inboxResult.error }, 502);
+    }
+
+    const historyRecord = await recordHistoryEntry(env, chatId, inboxResult.payload, "imported", plan);
+
+    await sendTelegramMessage(
+      env.TELEGRAM_BOT_TOKEN,
+      chatId,
+      buildImportSuccessMessage(inboxResult.payload, historyRecord),
+      {
+        parse_mode: "HTML",
+        reply_markup: buildMailboxKeyboard(reference.localPart, historyRecord),
+      },
+    );
+
+    return json({ ok: true, handled: true, pending: pendingAction.type, email: inboxResult.payload.email }, 200);
+  }
+
+  if (pendingAction.type === "note") {
+    const note = normalizeHistoryNote(text);
+
+    if (!note) {
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildNoteUsageMessage("Catatan belum diisi."), {
+        parse_mode: "HTML",
+      });
+
+      return json({ ok: true, handled: true, pending: pendingAction.type, error: "Catatan belum diisi." }, 200);
+    }
+
+    const historyState = await updateHistoryNote(env, chatId, pendingAction.email, note, plan);
+
+    await sendTelegramMessage(
+      env.TELEGRAM_BOT_TOKEN,
+      chatId,
+      buildNoteResultMessage(pendingAction.email, note, historyState),
+      {
+        parse_mode: "HTML",
+        reply_markup: buildMailboxKeyboard(pendingAction.localPart, historyState),
+      },
+    );
+
+    return json({ ok: true, handled: true, pending: pendingAction.type, email: pendingAction.email }, 200);
+  }
+
+  return json({ ok: true, ignored: true }, 200);
 }
 
 async function generateMailbox(request) {
@@ -1288,6 +1412,23 @@ async function updateHistoryNote(env, chatId, email, note, plan = getChatPlan(en
   return normalizeHistoryState(result, plan);
 }
 
+async function getPendingAction(env, chatId) {
+  const result = await invokeHistoryStore(env, chatId, "/pending_get", {});
+  return normalizePendingAction(result?.pending);
+}
+
+async function setPendingAction(env, chatId, pending) {
+  const result = await invokeHistoryStore(env, chatId, "/pending_set", {
+    pending: normalizePendingAction(pending),
+  });
+  return normalizePendingAction(result?.pending);
+}
+
+async function clearPendingAction(env, chatId) {
+  const result = await invokeHistoryStore(env, chatId, "/pending_clear", {});
+  return normalizePendingAction(result?.pending);
+}
+
 async function invokeHistoryStore(env, chatId, path, payload) {
   if (env?.TEMP_MGEN_STATE) {
     const id = env.TEMP_MGEN_STATE.idFromName(`chat:${chatId}`);
@@ -1309,12 +1450,43 @@ async function invokeHistoryStore(env, chatId, path, payload) {
 function fallbackHistoryStoreFetch(chatId, path, payload) {
   const key = String(chatId ?? "unknown");
   const existing = normalizeStoredHistory(FALLBACK_HISTORY_STORE.get(key));
+  const pending = normalizePendingAction(FALLBACK_PENDING_STORE.get(key));
 
   if (path === "/state") {
     return {
       ok: true,
       items: existing,
       count: existing.length,
+    };
+  }
+
+  if (path === "/pending_get") {
+    return {
+      ok: true,
+      pending,
+    };
+  }
+
+  if (path === "/pending_set") {
+    const nextPending = normalizePendingAction(payload?.pending);
+
+    if (nextPending) {
+      FALLBACK_PENDING_STORE.set(key, nextPending);
+    } else {
+      FALLBACK_PENDING_STORE.delete(key);
+    }
+
+    return {
+      ok: true,
+      pending: nextPending,
+    };
+  }
+
+  if (path === "/pending_clear") {
+    FALLBACK_PENDING_STORE.delete(key);
+    return {
+      ok: true,
+      pending: null,
     };
   }
 
@@ -1518,6 +1690,34 @@ function normalizeStoredHistory(items) {
     .filter(Boolean);
 }
 
+function normalizePendingAction(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const type = String(value.type ?? "").trim().toLowerCase();
+
+  if (type === "import") {
+    return { type: "import" };
+  }
+
+  if (type === "note") {
+    const reference = parseMailboxReference(value.email || value.localPart);
+
+    if (!reference.ok) {
+      return null;
+    }
+
+    return {
+      type: "note",
+      email: reference.email,
+      localPart: reference.localPart,
+    };
+  }
+
+  return null;
+}
+
 function normalizeHistorySource(value, fallback = "generated") {
   const normalized = String(value ?? fallback).trim().toLowerCase();
   return normalized === "imported" ? "imported" : "generated";
@@ -1609,6 +1809,26 @@ function findHistoryEntry(historyState, emailOrLocalPart) {
       (item) => item.email === reference.email || item.localPart === reference.localPart,
     ) || null
   );
+}
+
+function paginateHistoryItems(historyState, page = 0, pageSize = 5) {
+  const items = Array.isArray(historyState?.items) ? historyState.items : [];
+  const pageCount = Math.max(1, Math.ceil(items.length / pageSize));
+  const safePage = Math.min(Math.max(0, page), pageCount - 1);
+  const start = safePage * pageSize;
+  const pageItems = items.slice(start, start + pageSize);
+
+  return {
+    items,
+    pageItems,
+    pageCount,
+    safePage,
+  };
+}
+
+function shortenEmailForButton(email) {
+  const value = String(email ?? "");
+  return value.length > 28 ? `${value.slice(0, 25)}...` : value;
 }
 
 function parseTelegramCommand(text) {
@@ -1753,6 +1973,38 @@ function buildHistoryMessage(historyState) {
   return lines.join("\n");
 }
 
+function buildHistorySelectorMessage(historyState, page = 0) {
+  const { items, pageItems, pageCount, safePage } = paginateHistoryItems(historyState, page, 5);
+
+  if (!items.length) {
+    return [
+      "<b>History email</b>",
+      "",
+      "Belum ada email di history.",
+      "Tekan tombol <code>Email Baru</code> atau <code>Import Email</code>.",
+    ].join("\n");
+  }
+
+  const lines = [
+    "<b>Pilih email</b>",
+    "",
+    `Halaman: <code>${safePage + 1}/${pageCount}</code>`,
+    `Total: <code>${escapeHtml(String(items.length))}</code> email`,
+    "",
+  ];
+
+  for (const [index, item] of pageItems.entries()) {
+    const absoluteIndex = safePage * 5 + index + 1;
+    lines.push(`${absoluteIndex}. <code>${escapeHtml(item.email)}</code>`);
+    if (item.note) {
+      lines.push(`   catatan: ${escapeHtml(item.note)}`);
+    }
+    lines.push("");
+  }
+
+  return lines.join("\n").trim();
+}
+
 function buildHistoryLimitMessage(historyState) {
   const lines = [
     "<b>History email sudah penuh</b>",
@@ -1876,6 +2128,15 @@ function buildNoteUsageMessage(error) {
     .join("\n");
 }
 
+function buildNotePromptMessage(email) {
+  return [
+    "<b>Tambah catatan</b>",
+    "",
+    `<code>${escapeHtml(email)}</code>`,
+    "Kirim catatan untuk email ini.",
+  ].join("\n");
+}
+
 function buildInboxMessage(payload, options = {}) {
   const lines = [
     options.refreshed ? "<b>Inbox diperbarui</b>" : "<b>Inbox email</b>",
@@ -1944,6 +2205,17 @@ function buildImportUsageMessage(error) {
     .join("\n");
 }
 
+function buildImportPromptMessage() {
+  return [
+    "<b>Import email</b>",
+    "",
+    "Kirim email yang ingin diimport.",
+    "Contoh:",
+    `<code>andipakukediri99@${FIXED_DOMAIN}</code>`,
+    "<code>nama@sharklasers.com</code>",
+  ].join("\n");
+}
+
 function buildInboxUsageMessage(error) {
   return [
     "<b>Cara buka inbox</b>",
@@ -1978,12 +2250,12 @@ function buildUnknownCommandMessage() {
 function buildHomeKeyboard(historyState) {
   const rows = [
     [
-      { text: "Pindah Email", callback_data: "new" },
-      { text: "History", callback_data: "history" },
+      { text: "Email Baru", callback_data: "new" },
+      { text: "Pindah Email", callback_data: "history_select:0" },
     ],
     [
-      { text: "Import Email", callback_data: "import_help" },
-      { text: "Hapus Email", callback_data: "delete_help" },
+      { text: "History", callback_data: "history" },
+      { text: "Import Email", callback_data: "import_prompt" },
     ],
   ];
 
@@ -2002,13 +2274,54 @@ function buildMailboxKeyboard(localPart, historyState) {
     ],
     [
       { text: "History", callback_data: "history" },
-      { text: "Pindah Email", callback_data: "new" },
+      { text: "Pindah Email", callback_data: "history_select:0" },
     ],
     [
-      { text: "Import Email", callback_data: "import_help" },
+      { text: "Catatan", callback_data: `note_prompt:${localPart}` },
       { text: "Hapus Email", callback_data: `delete:${localPart}` },
     ],
+    [
+      { text: "Email Baru", callback_data: "new" },
+      { text: "Import Email", callback_data: "import_prompt" },
+    ],
   ];
+
+  if (!historyState.isPremium && !historyState.isAdmin) {
+    rows.push([{ text: "Pembelian 5k/bulan", url: ADMIN_TELEGRAM_URL }]);
+  }
+
+  return { inline_keyboard: rows };
+}
+
+function buildHistorySelectorKeyboard(historyState, page = 0) {
+  const rows = [];
+  const { pageItems, pageCount, safePage } = paginateHistoryItems(historyState, page, 5);
+
+  for (const item of pageItems) {
+    rows.push([{ text: shortenEmailForButton(item.email), callback_data: `inbox:${item.localPart}` }]);
+    rows.push([
+      { text: "Catatan", callback_data: `note_prompt:${item.localPart}` },
+      { text: "Hapus", callback_data: `delete:${item.localPart}` },
+    ]);
+  }
+
+  if (pageCount > 1) {
+    const nav = [];
+    if (safePage > 0) {
+      nav.push({ text: "Prev", callback_data: `history_select:${safePage - 1}` });
+    }
+    if (safePage < pageCount - 1) {
+      nav.push({ text: "Next", callback_data: `history_select:${safePage + 1}` });
+    }
+    if (nav.length) {
+      rows.push(nav);
+    }
+  }
+
+  rows.push([
+    { text: "Email Baru", callback_data: "new" },
+    { text: "Import Email", callback_data: "import_prompt" },
+  ]);
 
   if (!historyState.isPremium && !historyState.isAdmin) {
     rows.push([{ text: "Pembelian 5k/bulan", url: ADMIN_TELEGRAM_URL }]);
@@ -2320,6 +2633,41 @@ export class TempMGenState {
       );
     }
 
+    if (url.pathname === "/pending_get") {
+      return json(
+        {
+          ok: true,
+          pending: await this.readPending(),
+        },
+        200,
+      );
+    }
+
+    if (url.pathname === "/pending_set") {
+      const pending = normalizePendingAction(body?.pending);
+      await this.writePending(pending);
+
+      return json(
+        {
+          ok: true,
+          pending,
+        },
+        200,
+      );
+    }
+
+    if (url.pathname === "/pending_clear") {
+      await this.writePending(null);
+
+      return json(
+        {
+          ok: true,
+          pending: null,
+        },
+        200,
+      );
+    }
+
     if (url.pathname === "/delete") {
       const items = await this.readHistory();
       const reference = parseMailboxReference(body?.email || body?.localPart);
@@ -2512,5 +2860,19 @@ export class TempMGenState {
 
   async writeHistory(items) {
     await this.state.storage.put("history", normalizeStoredHistory(items));
+  }
+
+  async readPending() {
+    const stored = await this.state.storage.get("pending");
+    return normalizePendingAction(stored);
+  }
+
+  async writePending(pending) {
+    if (pending) {
+      await this.state.storage.put("pending", normalizePendingAction(pending));
+      return;
+    }
+
+    await this.state.storage.delete("pending");
   }
 }
