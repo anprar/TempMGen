@@ -2606,8 +2606,6 @@ function buildHistoryMessage(historyState) {
 
   for (const [index, item] of previewItems.entries()) {
     lines.push(`${index + 1}. <code>${escapeHtml(item.email)}</code>`);
-    lines.push(`   sumber: <code>${escapeHtml(item.source)}</code>`);
-
     if (item.note) {
       lines.push(`   catatan: ${escapeHtml(item.note)}`);
     }
@@ -2813,14 +2811,6 @@ function buildInboxMessage(payload, options = {}) {
     );
   }
 
-  if (payload.otpCodes?.length) {
-    lines.push("");
-
-    for (const code of payload.otpCodes) {
-      lines.push(`<code>${escapeHtml(code)}</code>`);
-    }
-  }
-
   if (!payload.messages.length) {
     lines.push("", "Belum ada pesan masuk.");
     return lines.join("\n");
@@ -2829,6 +2819,8 @@ function buildInboxMessage(payload, options = {}) {
   lines.push("", `Pesan terbaru: <code>${escapeHtml(String(payload.messageCount))}</code>`);
 
   for (const [index, item] of payload.messages.slice(0, 5).entries()) {
+    const messageOtpCodes = extractOtpCodesFromText(`${item.subject || ""} ${item.excerpt || ""}`);
+
     lines.push(
       "",
       `${index + 1}. <b>${escapeHtml(item.subject || "Tanpa subjek")}</b>`,
@@ -2836,6 +2828,10 @@ function buildInboxMessage(payload, options = {}) {
       `Waktu: <code>${escapeHtml(item.date || "-")}</code>`,
       escapeHtml(item.excerpt || "(tidak ada preview)"),
     );
+
+    for (const code of messageOtpCodes) {
+      lines.push(`<code>${escapeHtml(code)}</code>`);
+    }
   }
 
   if (payload.messages.length > 5) {
