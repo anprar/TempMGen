@@ -1,6 +1,4 @@
-const GUERRILLA_API_URL = "https://api.guerrillamail.com/ajax.php";
-const SESSION_COOKIE = "TEMPMGEN_GMSESSID";
-const FIXED_DOMAIN = "pokemail.net";
+const MAIL_TM_API_URL = "https://api.mail.tm";
 const DEFAULT_HISTORY_LIMIT = 5;
 const PREMIUM_HISTORY_LIMIT = 25;
 const PREMIUM_HISTORY_PRICE_LABEL = "5k/bulan";
@@ -10,19 +8,7 @@ const HISTORY_PREVIEW_LIMIT = 25;
 const HISTORY_NOTE_MAX_LENGTH = 300;
 const FALLBACK_HISTORY_STORE = new Map();
 const FALLBACK_PENDING_STORE = new Map();
-const SUPPORTED_EMAIL_DOMAINS = [
-  "sharklasers.com",
-  "guerrillamail.info",
-  "grr.la",
-  "guerrillamail.biz",
-  "guerrillamail.com",
-  "guerrillamail.de",
-  "guerrillamail.net",
-  "guerrillamail.org",
-  "guerrillamailblock.com",
-  "pokemail.net",
-  "spam4.me",
-];
+const DOMAIN_EXAMPLE_FALLBACK = "email@domain.tld";
 const PASSWORD_ANIMALS = [
   "Gajah",
   "Harimau",
@@ -255,8 +241,7 @@ export default {
         {
           ok: true,
           service: "TempMGen",
-          provider: "Guerrilla Mail",
-          fixedDomain: FIXED_DOMAIN,
+          provider: "mail.tm",
           generator: getGeneratorInfo(),
           hasTelegramToken: Boolean(env.TELEGRAM_BOT_TOKEN),
           telegramWebhookPath: "/telegram/webhook",
@@ -270,18 +255,7 @@ export default {
     }
 
     if (url.pathname === "/api/domains" && request.method === "GET") {
-      return json(
-        {
-          ok: true,
-          provider: "Guerrilla Mail",
-          locked: true,
-          fixedDomain: FIXED_DOMAIN,
-          domains: [FIXED_DOMAIN],
-          generator: getGeneratorInfo(),
-          note: "Domain dikunci ke @pokemail.net. Nama email dibuat otomatis di Worker.",
-        },
-        200,
-      );
+      return handleDomains();
     }
 
     if (url.pathname === "/api/create" && request.method === "POST") {
@@ -323,13 +297,25 @@ async function handleCreate(request) {
     return json({ ok: false, error: result.error }, 502);
   }
 
-  const response = json(result.payload, 200);
+  return json(result.payload, 200);
+}
 
-  if (result.sessionId) {
-    response.headers.append("set-cookie", serializeCookie(SESSION_COOKIE, result.sessionId));
+async function handleDomains() {
+  const result = await fetchAvailableDomains();
+
+  if (!result.ok) {
+    return json({ ok: false, error: result.error }, 502);
   }
 
-  return response;
+  return json(
+    {
+      ok: true,
+      provider: "mail.tm",
+      domains: result.domains,
+      generator: getGeneratorInfo(),
+    },
+    200,
+  );
 }
 
 async function handleTelegramWebhook(request, env) {
@@ -475,7 +461,7 @@ async function handleTelegramWebhook(request, env) {
       buildNoteResultMessage(noteInput.email, noteInput.note, historyState),
       {
         parse_mode: "HTML",
-        reply_markup: buildMailboxKeyboard(noteInput.localPart, historyState),
+        reply_markup: buildMailboxKeyboard(noteInput.email, historyState),
       },
     );
 
@@ -520,26 +506,25 @@ async function handleTelegramWebhook(request, env) {
 
     await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildNewEmailMessage(result.payload, historyRecord), {
       parse_mode: "HTML",
-      reply_markup: buildMailboxKeyboard(result.payload.username, historyRecord),
+      reply_markup: buildMailboxKeyboard(result.payload.email, historyRecord),
     });
 
     return json({ ok: true, handled: true, command, email: result.payload.email }, 200);
   }
 
   if (command === "import") {
-    const reference = resolveMailboxReference(message, parsedCommand.argsText);
+    const historyState = await getHistoryState(env, chatId, plan);
+    const importInput = resolveImportInput(parsedCommand.argsText, historyState);
 
-    if (!reference.ok) {
-      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildImportUsageMessage(reference.error), {
+    if (!importInput.ok) {
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildImportUsageMessage(importInput.error), {
         parse_mode: "HTML",
       });
 
-      return json({ ok: true, handled: true, command, error: reference.error }, 200);
+      return json({ ok: true, handled: true, command, error: importInput.error }, 200);
     }
 
-    const historyState = await getHistoryState(env, chatId, plan);
-
-    if (isHistoryLimitReached(historyState) && !hasHistoryEmail(historyState, reference.email)) {
+    if (isHistoryLimitReached(historyState) && !hasHistoryEmail(historyState, importInput.email)) {
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildHistoryLimitMessage(historyState), {
         parse_mode: "HTML",
         reply_markup: buildHomeKeyboard(historyState),
@@ -548,8 +533,10 @@ async function handleTelegramWebhook(request, env) {
       return json({ ok: true, handled: true, command, error: "History limit reached" }, 200);
     }
 
-    const inboxResult = await getMailboxInbox(request, reference.localPart, {
-      displayEmail: reference.email,
+    const inboxResult = await getMailboxInbox(request, importInput.localPart, {
+      displayEmail: importInput.email,
+      mailboxPassword: importInput.password,
+      historyEntry: importInput.historyEntry,
     });
 
     if (!inboxResult.ok) {
@@ -576,7 +563,7 @@ async function handleTelegramWebhook(request, env) {
 
     await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildImportSuccessMessage(inboxResult.payload, historyRecord), {
       parse_mode: "HTML",
-      reply_markup: buildMailboxKeyboard(reference.localPart, historyRecord),
+      reply_markup: buildMailboxKeyboard(inboxResult.payload.email, historyRecord),
     });
 
     return json({ ok: true, handled: true, command, email: inboxResult.payload.email }, 200);
@@ -617,7 +604,7 @@ async function handleTelegramWebhook(request, env) {
       buildInboxMessage(inboxResult.payload, { refreshed: command === "refresh" }),
       {
         parse_mode: "HTML",
-        reply_markup: buildMailboxKeyboard(reference.localPart, historyState),
+        reply_markup: buildMailboxKeyboard(inboxResult.payload.email, historyState),
       },
     );
 
@@ -693,7 +680,7 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
       await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Email baru dibuat.");
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildNewEmailMessage(result.payload, historyRecord), {
         parse_mode: "HTML",
-        reply_markup: buildMailboxKeyboard(result.payload.username, historyRecord),
+        reply_markup: buildMailboxKeyboard(result.payload.email, historyRecord),
       });
 
       return json({ ok: true, handled: true, callback: data, email: result.payload.email }, 200);
@@ -806,7 +793,7 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
       await answerTelegramCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, "Kirim catatan untuk email ini.");
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildNotePromptMessage(targetEmail), {
         parse_mode: "HTML",
-        reply_markup: buildMailboxKeyboard(mailbox.localPart, historyState),
+        reply_markup: buildMailboxKeyboard(targetEmail, historyState),
         reply_parameters: callbackQuery?.message?.message_id
           ? { message_id: callbackQuery.message.message_id }
           : undefined,
@@ -848,7 +835,7 @@ async function handleTelegramCallbackQuery(request, env, callbackQuery) {
       buildInboxMessage(inboxResult.payload, { refreshed: action === "refresh" }),
       {
         parse_mode: "HTML",
-        reply_markup: buildMailboxKeyboard(mailbox.localPart, historyState),
+        reply_markup: buildMailboxKeyboard(inboxResult.payload.email, historyState),
       },
     );
 
@@ -869,19 +856,18 @@ async function handlePendingTelegramInput(request, env, message, text, pendingAc
   await clearPendingAction(env, chatId);
 
   if (pendingAction.type === "import") {
-    const reference = parseMailboxReference(text);
+    const historyState = await getHistoryState(env, chatId, plan);
+    const importInput = resolveImportInput(text, historyState);
 
-    if (!reference.ok) {
-      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildImportUsageMessage(reference.error), {
+    if (!importInput.ok) {
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildImportUsageMessage(importInput.error), {
         parse_mode: "HTML",
       });
 
-      return json({ ok: true, handled: true, pending: pendingAction.type, error: reference.error }, 200);
+      return json({ ok: true, handled: true, pending: pendingAction.type, error: importInput.error }, 200);
     }
 
-    const historyState = await getHistoryState(env, chatId, plan);
-
-    if (isHistoryLimitReached(historyState) && !hasHistoryEmail(historyState, reference.email)) {
+    if (isHistoryLimitReached(historyState) && !hasHistoryEmail(historyState, importInput.email)) {
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, buildHistoryLimitMessage(historyState), {
         parse_mode: "HTML",
         reply_markup: buildHomeKeyboard(historyState),
@@ -890,8 +876,10 @@ async function handlePendingTelegramInput(request, env, message, text, pendingAc
       return json({ ok: true, handled: true, pending: pendingAction.type, error: "History limit reached" }, 200);
     }
 
-    const inboxResult = await getMailboxInbox(request, reference.localPart, {
-      displayEmail: reference.email,
+    const inboxResult = await getMailboxInbox(request, importInput.localPart, {
+      displayEmail: importInput.email,
+      mailboxPassword: importInput.password,
+      historyEntry: importInput.historyEntry,
     });
 
     if (!inboxResult.ok) {
@@ -913,7 +901,7 @@ async function handlePendingTelegramInput(request, env, message, text, pendingAc
       buildImportSuccessMessage(inboxResult.payload, historyRecord),
       {
         parse_mode: "HTML",
-        reply_markup: buildMailboxKeyboard(reference.localPart, historyRecord),
+        reply_markup: buildMailboxKeyboard(inboxResult.payload.email, historyRecord),
       },
     );
 
@@ -939,7 +927,7 @@ async function handlePendingTelegramInput(request, env, message, text, pendingAc
       buildNoteResultMessage(pendingAction.email, note, historyState),
       {
         parse_mode: "HTML",
-        reply_markup: buildMailboxKeyboard(pendingAction.localPart, historyState),
+        reply_markup: buildMailboxKeyboard(pendingAction.email, historyState),
       },
     );
 
@@ -949,264 +937,229 @@ async function handlePendingTelegramInput(request, env, message, text, pendingAc
   return json({ ok: true, ignored: true }, 200);
 }
 
-async function generateMailbox(request) {
+async function generateMailbox() {
+  const domainsResult = await fetchAvailableDomains();
+
+  if (!domainsResult.ok || !domainsResult.domains.length) {
+    return { ok: false, error: domainsResult.error || "Domain email tidak tersedia." };
+  }
+
   const generated = generateIdentity();
   const passwordSuggestion = generatePasswordSuggestion();
   const vcc = generateDummyVcc();
 
-  return withMailboxSession(request, generated.username, async ({ client, actualEmail, sessionId }) => {
-    const inboxResult = await fetchMailboxMessages(client, sessionId, {
-      deleteSystemMessages: true,
-    });
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const localPart = attempt === 0 ? generated.username : `${generated.username}${attempt}`.slice(0, 40);
+    const domain = domainsResult.domains[attempt % domainsResult.domains.length];
+    const email = `${localPart}@${domain}`;
 
-    if (!inboxResult.ok) {
-      return { ok: false, error: inboxResult.error };
+    const accountResult = await createMailTmAccount(email, passwordSuggestion);
+
+    if (!accountResult.ok) {
+      if (accountResult.code === "address_exists") {
+        continue;
+      }
+
+      return { ok: false, error: accountResult.error };
     }
 
-    const displayEmail = `${generated.username}@${FIXED_DOMAIN}`;
-    const otpCodes = extractOtpCodes(inboxResult.messages);
-
-    return {
-      ok: true,
-      sessionId: inboxResult.sessionId || sessionId,
-      payload: {
-        ok: true,
-        email: displayEmail,
-        actualEmail,
-        username: generated.username,
-        domain: FIXED_DOMAIN,
-        parts: generated.parts,
-        generator: getGeneratorInfo(),
+    const inboxResult = await getMailboxInbox(null, localPart, {
+      displayEmail: email,
+      mailboxPassword: passwordSuggestion,
+      historyEntry: {
+        email,
+        localPart,
         passwordSuggestion,
         vcc,
-        inboxStatus: inboxResult.messages.length ? `Ada ${inboxResult.messages.length} pesan` : "Kosong",
-        messageCount: inboxResult.messages.length,
-        messages: inboxResult.messages,
-        otpCodes,
       },
-    };
-  });
-}
-
-async function getMailboxInbox(request, localPart, options = {}) {
-  return withMailboxSession(request, localPart, async ({ client, sessionId, actualEmail }) => {
-    const inboxResult = await fetchMailboxMessages(client, sessionId, {
-      deleteSystemMessages: true,
     });
 
     if (!inboxResult.ok) {
       return { ok: false, error: inboxResult.error };
     }
 
-    const displayEmail = options.displayEmail || `${localPart}@${FIXED_DOMAIN}`;
-    const historyEntry = options.historyEntry || null;
-    const otpCodes = extractOtpCodes(inboxResult.messages);
-
     return {
       ok: true,
-      sessionId: inboxResult.sessionId || sessionId,
       payload: {
-        ok: true,
-        email: displayEmail,
-        actualEmail,
-        username: localPart,
-        domain: getEmailDomain(displayEmail),
-        messageCount: inboxResult.messages.length,
-        messages: inboxResult.messages,
-        otpCodes,
-        passwordSuggestion: historyEntry?.passwordSuggestion || "",
-        vcc: historyEntry?.vcc || null,
+        ...inboxResult.payload,
+        parts: generated.parts,
+        generator: getGeneratorInfo(),
+        inboxStatus: inboxResult.payload.messageCount ? `Ada ${inboxResult.payload.messageCount} pesan` : "Kosong",
       },
     };
-  });
+  }
+
+  return { ok: false, error: "Gagal membuat email baru. Silakan coba lagi." };
 }
 
-async function withMailboxSession(request, localPart, run) {
-  const client = getClientDetails(request);
-  const storedSessionId = getCookie(request.headers.get("cookie"), SESSION_COOKIE);
+async function getMailboxInbox(_request, localPart, options = {}) {
+  const displayEmail = String(options.displayEmail || "").trim().toLowerCase();
+  const historyEntry = options.historyEntry || null;
+  const password =
+    String(options.mailboxPassword || historyEntry?.mailboxPassword || historyEntry?.passwordSuggestion || "").trim();
 
-  const initResponse = await callGuerrilla(
-    {
-      f: "get_email_address",
-      ip: client.ip,
-      agent: client.agent,
-      lang: "en",
-    },
-    storedSessionId,
-  );
-
-  if (!initResponse.ok) {
-    return { ok: false, error: initResponse.error };
+  if (!displayEmail) {
+    return { ok: false, error: "Email target belum tersedia." };
   }
 
-  const activeSessionId = initResponse.sessionId || storedSessionId;
-  const setResponse = await callGuerrilla(
-    {
-      f: "set_email_user",
-      email_user: localPart,
-      ip: client.ip,
-      agent: client.agent,
-      lang: "en",
-    },
-    activeSessionId,
-  );
-
-  if (!setResponse.ok) {
-    return { ok: false, error: setResponse.error };
+  if (!password) {
+    return { ok: false, error: "Password email belum tersimpan. Import ulang email dengan password-nya." };
   }
 
-  if (setResponse.data?.error) {
-    return { ok: false, error: String(setResponse.data.error) };
+  const tokenResult = await createMailTmToken(displayEmail, password);
+
+  if (!tokenResult.ok) {
+    return { ok: false, error: tokenResult.error };
   }
 
-  const sessionId = setResponse.sessionId || activeSessionId;
-  const actualEmail = String(setResponse.data?.email_addr || "").trim();
-  return run({ client, sessionId, actualEmail, localPart });
-}
+  const messagesResult = await fetchMailTmMessages(tokenResult.token);
 
-async function callGuerrilla(params, sessionId) {
-  const query = new URLSearchParams();
-
-  for (const [key, value] of Object.entries(params)) {
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        query.append(`${key}[]`, String(item));
-      }
-      continue;
-    }
-
-    query.set(key, String(value));
-  }
-
-  const headers = {
-    Accept: "application/json",
-  };
-
-  if (sessionId) {
-    headers.Cookie = `PHPSESSID=${sessionId}`;
-  }
-
-  try {
-    const response = await fetch(`${GUERRILLA_API_URL}?${query.toString()}`, {
-      method: "GET",
-      headers,
-    });
-    const raw = await response.text();
-    const setCookie = response.headers.get("set-cookie") || "";
-    const nextSessionId = extractSetCookie(setCookie, "PHPSESSID") || sessionId;
-
-    if (!response.ok) {
-      return {
-        ok: false,
-        error: raw || `Guerrilla request failed with status ${response.status}`,
-        sessionId: nextSessionId,
-      };
-    }
-
-    let data;
-
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      return {
-        ok: false,
-        error: "Guerrilla returned invalid JSON.",
-        sessionId: nextSessionId,
-      };
-    }
-
-    return {
-      ok: true,
-      data,
-      sessionId: nextSessionId,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error instanceof Error ? error.message : "Unknown upstream error",
-      sessionId,
-    };
-  }
-}
-
-async function fetchMailboxMessages(client, sessionId, options = {}) {
-  let activeSessionId = sessionId;
-
-  const loadMessages = async () => {
-    const response = await callGuerrilla(
-      {
-        f: "get_email_list",
-        offset: 0,
-        ip: client.ip,
-        agent: client.agent,
-        lang: "en",
-      },
-      activeSessionId,
-    );
-
-    if (!response.ok) {
-      return response;
-    }
-
-    activeSessionId = response.sessionId || activeSessionId;
-    return response;
-  };
-
-  let listResponse = await loadMessages();
-
-  if (!listResponse.ok) {
-    return { ok: false, error: listResponse.error, sessionId: activeSessionId };
-  }
-
-  if (listResponse.data?.error) {
-    return { ok: false, error: String(listResponse.data.error), sessionId: activeSessionId };
-  }
-
-  let messages = Array.isArray(listResponse.data?.list)
-    ? listResponse.data.list.map((item) => normalizeMailboxMessage(item))
-    : [];
-
-  if (options.deleteSystemMessages) {
-    const systemMessageIds = messages.filter((item) => isSystemMailboxMessage(item)).map((item) => item.id);
-
-    if (systemMessageIds.length) {
-      const deleteResponse = await callGuerrilla(
-        {
-          f: "del_email",
-          email_ids: systemMessageIds,
-          ip: client.ip,
-          agent: client.agent,
-          lang: "en",
-        },
-        activeSessionId,
-      );
-
-      if (!deleteResponse.ok) {
-        return { ok: false, error: deleteResponse.error, sessionId: activeSessionId };
-      }
-
-      activeSessionId = deleteResponse.sessionId || activeSessionId;
-      listResponse = await loadMessages();
-
-      if (!listResponse.ok) {
-        return { ok: false, error: listResponse.error, sessionId: activeSessionId };
-      }
-
-      if (listResponse.data?.error) {
-        return { ok: false, error: String(listResponse.data.error), sessionId: activeSessionId };
-      }
-
-      messages = Array.isArray(listResponse.data?.list)
-        ? listResponse.data.list.map((item) => normalizeMailboxMessage(item))
-        : [];
-    }
+  if (!messagesResult.ok) {
+    return { ok: false, error: messagesResult.error };
   }
 
   return {
     ok: true,
-    sessionId: activeSessionId,
-    messages: messages.filter((item) => !isSystemMailboxMessage(item)),
+    payload: {
+      ok: true,
+      email: displayEmail,
+      actualEmail: displayEmail,
+      username: localPart,
+      domain: getEmailDomain(displayEmail),
+      messageCount: messagesResult.messages.length,
+      messages: messagesResult.messages,
+      otpCodes: extractOtpCodes(messagesResult.messages),
+      passwordSuggestion: password,
+      mailboxPassword: password,
+      vcc: historyEntry?.vcc || null,
+    },
   };
+}
+
+async function fetchMailTmJson(path, options = {}) {
+  const headers = {
+    Accept: "application/json",
+    ...(options.body ? { "Content-Type": "application/json" } : {}),
+    ...(options.token ? { Authorization: `Bearer ${options.token}` } : {}),
+  };
+
+  try {
+    const response = await fetch(`${MAIL_TM_API_URL}${path}`, {
+      method: options.method || "GET",
+      headers,
+      body: options.body ? JSON.stringify(options.body) : undefined,
+    });
+    const raw = await response.text();
+    let data = null;
+
+    try {
+      data = raw ? JSON.parse(raw) : null;
+    } catch {
+      data = null;
+    }
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        error: data?.message || data?.detail || raw || `mail.tm request failed with status ${response.status}`,
+        data,
+      };
+    }
+
+    return {
+      ok: true,
+      status: response.status,
+      data,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      error: error instanceof Error ? error.message : "Unknown upstream error",
+      data: null,
+    };
+  }
+}
+
+async function fetchAvailableDomains() {
+  const result = await fetchMailTmJson("/domains");
+
+  if (!result.ok) {
+    return { ok: false, error: result.error, domains: [] };
+  }
+
+  const domains = extractHydraMembers(result.data)
+    .filter((item) => item && item.isActive !== false && typeof item.domain === "string")
+    .map((item) => String(item.domain).trim().toLowerCase())
+    .filter(Boolean);
+
+  if (!domains.length) {
+    return { ok: false, error: "mail.tm tidak mengembalikan domain aktif.", domains: [] };
+  }
+
+  return { ok: true, domains };
+}
+
+async function createMailTmAccount(address, password) {
+  const result = await fetchMailTmJson("/accounts", {
+    method: "POST",
+    body: { address, password },
+  });
+
+  if (result.ok) {
+    return { ok: true, account: result.data };
+  }
+
+  const message = String(result.error || "").toLowerCase();
+
+  if (result.status === 422 || message.includes("already") || message.includes("used")) {
+    return { ok: false, code: "address_exists", error: "Alamat email sudah terpakai." };
+  }
+
+  return { ok: false, code: "create_failed", error: result.error || "Gagal membuat akun email." };
+}
+
+async function createMailTmToken(address, password) {
+  const result = await fetchMailTmJson("/token", {
+    method: "POST",
+    body: { address, password },
+  });
+
+  if (!result.ok || !result.data?.token) {
+    return { ok: false, error: result.error || "Gagal login ke inbox email." };
+  }
+
+  return { ok: true, token: String(result.data.token) };
+}
+
+async function fetchMailTmMessages(token) {
+  const result = await fetchMailTmJson("/messages", { token });
+
+  if (!result.ok) {
+    return { ok: false, error: result.error, messages: [] };
+  }
+
+  return {
+    ok: true,
+    messages: extractHydraMembers(result.data).map((item) => normalizeMailboxMessage(item)),
+  };
+}
+
+function extractHydraMembers(data) {
+  if (!data) {
+    return [];
+  }
+
+  if (Array.isArray(data["hydra:member"])) {
+    return data["hydra:member"];
+  }
+
+  if (Array.isArray(data.member)) {
+    return data.member;
+  }
+
+  return [];
 }
 
 function generateIdentity() {
@@ -1296,11 +1249,11 @@ function calculateLuhnCheckDigit(baseNumber) {
 function getEmailDomain(email) {
   const normalized = String(email ?? "").trim().toLowerCase();
   const atIndex = normalized.lastIndexOf("@");
-  return atIndex >= 0 ? normalized.slice(atIndex + 1) : FIXED_DOMAIN;
+  return atIndex >= 0 ? normalized.slice(atIndex + 1) : "";
 }
 
 function isSupportedEmailDomain(domain) {
-  return SUPPORTED_EMAIL_DOMAINS.includes(String(domain ?? "").trim().toLowerCase());
+  return /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(String(domain ?? "").trim());
 }
 
 function extractOtpCodes(messages) {
@@ -1782,7 +1735,7 @@ function formatHistoryEmail(email, localPart) {
     return "";
   }
 
-  return `${normalizedLocalPart}@${FIXED_DOMAIN}`;
+  return normalizedLocalPart;
 }
 
 function hasHistoryEmail(historyState, email) {
@@ -1871,7 +1824,7 @@ function buildStartMessage(historyState) {
   return [
     "<b>TempMGen siap dipakai</b>",
     "",
-    `Domain tetap: <code>@${FIXED_DOMAIN}</code>`,
+    "Domain: <code>otomatis dari sistem</code>",
     "Pola nama: <code>nama + benda + kota + angka 0-99</code>",
     `History: <code>${escapeHtml(formatHistoryUsage(historyState))}</code>`,
     `Paket: <code>${escapeHtml(formatPlanName(historyState))}</code>`,
@@ -1879,7 +1832,7 @@ function buildStartMessage(historyState) {
     "Perintah:",
     "<code>/new</code> - buat email baru",
     "<code>/history</code> - lihat history email",
-    "<code>/import email</code> - import email lama atau email luar",
+    "<code>/import email password</code> - import email lama atau email luar",
     "<code>/delete email</code> - hapus 1 email dari history",
     "<code>/note email catatan</code> - simpan catatan email",
     "<code>/inbox email</code> - lihat inbox",
@@ -1924,6 +1877,20 @@ function buildImportSuccessMessage(payload, historyState) {
     `History: <code>${escapeHtml(formatHistoryUsage(historyState))}</code>`,
   ];
 
+  if (payload.passwordSuggestion) {
+    lines.push("", "Password:", `<code>${escapeHtml(payload.passwordSuggestion)}</code>`);
+  }
+
+  if (payload.vcc?.number) {
+    lines.push(
+      "",
+      "VCC dummy:",
+      `<code>${escapeHtml(payload.vcc.number)}</code>`,
+      `Exp: <code>${escapeHtml(payload.vcc.expText || "-")}</code>`,
+      `CVV: <code>${escapeHtml(payload.vcc.cvv || "-")}</code>`,
+    );
+  }
+
   if (payload.otpCodes?.length) {
     lines.push("", "OTP terdeteksi:");
     for (const code of payload.otpCodes) {
@@ -1965,9 +1932,9 @@ function buildHistoryMessage(historyState) {
 
   lines.push(
     "",
-    "Gunakan <code>/import email@pokemail.net</code> untuk recovery email tertentu.",
-    "Gunakan <code>/delete email@pokemail.net</code> untuk hapus history 1 email.",
-    "Gunakan <code>/note email@pokemail.net catatan</code> untuk menambah catatan.",
+    "Gunakan <code>/import email password</code> untuk recovery email tertentu.",
+    "Gunakan <code>/delete email</code> untuk hapus history 1 email.",
+    "Gunakan <code>/note email catatan</code> untuk menambah catatan.",
   );
 
   return lines.join("\n");
@@ -2079,8 +2046,8 @@ function buildDeleteUsageMessage(error) {
     error ? escapeHtml(error) : "",
     "",
     "Contoh:",
-    `<code>/delete andipakukediri99@${FIXED_DOMAIN}</code>`,
-    `<code>/delete andipakukediri99</code>`,
+    `<code>/delete ${DOMAIN_EXAMPLE_FALLBACK}</code>`,
+    "<code>/delete email-di-history</code>",
   ]
     .filter(Boolean)
     .join("\n");
@@ -2120,7 +2087,7 @@ function buildNoteUsageMessage(error) {
     error ? escapeHtml(error) : "",
     "",
     "Contoh:",
-    `<code>/note andipakukediri99@${FIXED_DOMAIN} akun marketplace</code>`,
+    `<code>/note ${DOMAIN_EXAMPLE_FALLBACK} akun marketplace</code>`,
     "Atau reply ke pesan email bot dengan:",
     "<code>/note akun marketplace</code>",
   ]
@@ -2197,9 +2164,8 @@ function buildImportUsageMessage(error) {
     error ? escapeHtml(error) : "",
     "",
     "Contoh:",
-    `<code>/import andipakukediri99@${FIXED_DOMAIN}</code>`,
-    "<code>/import nama@sharklasers.com</code>",
-    `<code>/import andipakukediri99</code>`,
+    `<code>/import ${DOMAIN_EXAMPLE_FALLBACK} password123</code>`,
+    "<code>/import email-di-history</code>",
   ]
     .filter(Boolean)
     .join("\n");
@@ -2209,10 +2175,10 @@ function buildImportPromptMessage() {
   return [
     "<b>Import email</b>",
     "",
-    "Kirim email yang ingin diimport.",
+    "Kirim email yang ingin diimport, lalu tambahkan password jika email itu belum ada di history.",
     "Contoh:",
-    `<code>andipakukediri99@${FIXED_DOMAIN}</code>`,
-    "<code>nama@sharklasers.com</code>",
+    `<code>${DOMAIN_EXAMPLE_FALLBACK} password123</code>`,
+    "<code>email-di-history</code>",
   ].join("\n");
 }
 
@@ -2223,8 +2189,8 @@ function buildInboxUsageMessage(error) {
     error ? escapeHtml(error) : "",
     "",
     "Contoh:",
-    `<code>/inbox andipakukediri99@${FIXED_DOMAIN}</code>`,
-    `<code>/refresh andipakukediri99@${FIXED_DOMAIN}</code>`,
+    `<code>/inbox ${DOMAIN_EXAMPLE_FALLBACK}</code>`,
+    `<code>/refresh ${DOMAIN_EXAMPLE_FALLBACK}</code>`,
     "Atau reply ke pesan email bot lalu kirim <code>/inbox</code>.",
   ]
     .filter(Boolean)
@@ -2243,7 +2209,7 @@ function buildUnknownCommandMessage() {
     "<code>/note email catatan</code>",
     "<code>/inbox email</code>",
     "<code>/refresh email</code>",
-    "<code>/import email</code>",
+    "<code>/import email password</code>",
   ].join("\n");
 }
 
@@ -2266,19 +2232,21 @@ function buildHomeKeyboard(historyState) {
   return { inline_keyboard: rows };
 }
 
-function buildMailboxKeyboard(localPart, historyState) {
+function buildMailboxKeyboard(targetEmail, historyState) {
+  const reference = parseMailboxReference(targetEmail);
+  const key = reference.ok ? reference.email : String(targetEmail ?? "");
   const rows = [
     [
-      { text: "Inbox", callback_data: `inbox:${localPart}` },
-      { text: "Refresh", callback_data: `refresh:${localPart}` },
+      { text: "Inbox", callback_data: `inbox:${key}` },
+      { text: "Refresh", callback_data: `refresh:${key}` },
     ],
     [
       { text: "History", callback_data: "history" },
       { text: "Pindah Email", callback_data: "history_select:0" },
     ],
     [
-      { text: "Catatan", callback_data: `note_prompt:${localPart}` },
-      { text: "Hapus Email", callback_data: `delete:${localPart}` },
+      { text: "Catatan", callback_data: `note_prompt:${key}` },
+      { text: "Hapus Email", callback_data: `delete:${key}` },
     ],
     [
       { text: "Email Baru", callback_data: "new" },
@@ -2298,10 +2266,10 @@ function buildHistorySelectorKeyboard(historyState, page = 0) {
   const { pageItems, pageCount, safePage } = paginateHistoryItems(historyState, page, 5);
 
   for (const item of pageItems) {
-    rows.push([{ text: shortenEmailForButton(item.email), callback_data: `inbox:${item.localPart}` }]);
+    rows.push([{ text: shortenEmailForButton(item.email), callback_data: `inbox:${item.email}` }]);
     rows.push([
-      { text: "Catatan", callback_data: `note_prompt:${item.localPart}` },
-      { text: "Hapus", callback_data: `delete:${item.localPart}` },
+      { text: "Catatan", callback_data: `note_prompt:${item.email}` },
+      { text: "Hapus", callback_data: `delete:${item.email}` },
     ]);
   }
 
@@ -2435,7 +2403,7 @@ function resolveNoteInput(message, argsText) {
   }
 
   const hasReplyReference = resolveMailboxReference(message, "").ok;
-  const startsWithExplicitEmail = /@pokemail\.net\b/i.test(raw);
+  const startsWithExplicitEmail = /@[a-z0-9.-]+\.[a-z]{2,}\b/i.test(raw);
 
   if (hasReplyReference && !startsWithExplicitEmail) {
     const replyReference = resolveMailboxReference(message, "");
@@ -2503,6 +2471,41 @@ function resolveNoteInput(message, argsText) {
   };
 }
 
+function resolveImportInput(rawText, historyState) {
+  const raw = String(rawText ?? "").trim();
+
+  if (!raw) {
+    return { ok: false, error: "Email belum diisi." };
+  }
+
+  const [firstToken, ...restTokens] = raw.split(/\s+/);
+  const reference = parseMailboxReference(firstToken);
+
+  if (!reference.ok) {
+    return { ok: false, error: reference.error };
+  }
+
+  const historyEntry = findHistoryEntry(historyState, reference.email || reference.localPart);
+  const password = restTokens.join(" ").trim() || historyEntry?.passwordSuggestion || "";
+  const email = historyEntry?.email || reference.email;
+
+  if (!email.includes("@")) {
+    return { ok: false, error: "Untuk import email di luar bot, kirim email lengkap beserta password." };
+  }
+
+  if (!password) {
+    return { ok: false, error: "Password email belum ada. Gunakan format: email password" };
+  }
+
+  return {
+    ok: true,
+    email,
+    localPart: reference.localPart,
+    password,
+    historyEntry,
+  };
+}
+
 function parseMailboxReference(text) {
   const raw = String(text ?? "").trim().toLowerCase();
 
@@ -2510,7 +2513,7 @@ function parseMailboxReference(text) {
     return { ok: false, error: "Email target kosong." };
   }
 
-  const emailMatch = raw.match(/([a-z0-9._+-]{1,40})@([a-z0-9.-]+)/);
+  const emailMatch = raw.match(/([a-z0-9._+-]{1,64})@([a-z0-9.-]+\.[a-z]{2,})/);
 
   if (emailMatch && isSupportedEmailDomain(emailMatch[2])) {
     return {
@@ -2522,35 +2525,39 @@ function parseMailboxReference(text) {
 
   const token = raw.split(/\s+/)[0];
 
-  if (/^[a-z0-9._+-]{1,40}$/.test(token)) {
+  if (/^[a-z0-9._+-]{1,64}$/.test(token)) {
     return {
       ok: true,
       localPart: token,
-      email: `${token}@${FIXED_DOMAIN}`,
+      email: token,
     };
   }
 
   return {
     ok: false,
-    error: `Gunakan email dengan domain yang didukung.`,
+    error: "Gunakan email yang valid.",
   };
 }
 
 function normalizeMailboxMessage(item) {
+  const fromAddress =
+    String(item?.from?.address || item?.from?.name || item?.mail_from || "")
+      .trim();
+  const subject = String(item?.subject || item?.mail_subject || "").trim();
+  const excerpt = String(item?.intro || item?.mail_excerpt || "").replace(/\s+/g, " ").trim();
+  const createdAt = String(item?.createdAt || item?.mail_date || "").trim();
+
   return {
-    id: String(item?.mail_id ?? ""),
-    from: decodeHtmlEntities(String(item?.mail_from ?? "")).trim(),
-    subject: decodeHtmlEntities(String(item?.mail_subject ?? "")).trim(),
-    excerpt: trimText(decodeHtmlEntities(String(item?.mail_excerpt ?? "")).replace(/\s+/g, " "), 180),
-    date: String(item?.mail_date ?? "").trim(),
+    id: String(item?.id || item?.mail_id || ""),
+    from: decodeHtmlEntities(fromAddress),
+    subject: decodeHtmlEntities(subject),
+    excerpt: trimText(decodeHtmlEntities(excerpt), 180),
+    date: formatMessageDate(createdAt),
   };
 }
 
 function isSystemMailboxMessage(item) {
-  const from = String(item?.from ?? "").trim().toLowerCase();
-  const subject = String(item?.subject ?? "").trim().toLowerCase();
-
-  return from === "no-reply@guerrillamail.com" && subject === "welcome to guerrilla mail";
+  return false;
 }
 
 function decodeHtmlEntities(value) {
@@ -2571,12 +2578,30 @@ function trimText(value, maxLength) {
   return `${value.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;
 }
 
+function formatMessageDate(value) {
+  const input = String(value ?? "").trim();
+
+  if (!input) {
+    return "-";
+  }
+
+  const date = new Date(input);
+
+  if (Number.isNaN(date.getTime())) {
+    return input;
+  }
+
+  return `${date.getUTCFullYear()}-${padNumber(date.getUTCMonth() + 1)}-${padNumber(date.getUTCDate())} ${padNumber(date.getUTCHours())}:${padNumber(date.getUTCMinutes())} UTC`;
+}
+
 function normalizeLocalPart(value) {
   const cleaned = String(value)
     .trim()
     .toLowerCase()
-    .replace(/[^a-z0-9]/g, "")
-    .slice(0, 40);
+    .replace(/[^a-z0-9._+-]/g, "")
+    .replace(/[._+-]{2,}/g, ".")
+    .replace(/^[._+-]+|[._+-]+$/g, "")
+    .slice(0, 64);
 
   return cleaned || "tempmgen0";
 }

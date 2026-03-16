@@ -3,8 +3,8 @@
 Web app sederhana untuk:
 
 - generate email otomatis dengan pola `namaorang + benda + kota + angka 0-99`
-- kunci domain output ke `@pokemail.net`
-- pakai session Guerrilla Mail di balik Worker
+- pakai domain aktif dari `mail.tm`
+- pakai akun email sementara berbasis `mail.tm`
 - terima update Telegram lewat webhook Worker
 - sediakan command bot `/start`, `/new`, `/history`, `/delete`, `/note`, `/inbox`, `/refresh`, dan `/import`
 - simpan history email Telegram dengan batas default 5, premium 25, dan admin unlimited
@@ -16,9 +16,7 @@ Web app sederhana untuk:
 - Static frontend (`public/`)
 - Worker API proxy (`src/worker.js`)
 
-Provider saat ini: `Guerrilla Mail`
-
-Domain output tetap: `@pokemail.net`
+Provider saat ini: `mail.tm`
 
 Skema generator:
 
@@ -29,7 +27,7 @@ Skema generator:
 
 Contoh hasil:
 
-- `andipakukediri99@pokemail.net`
+- `andipakukediri99@sharebot.net`
 
 ## Endpoint internal
 
@@ -80,13 +78,13 @@ curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<w
 ### Flow command saat ini
 
 - `/start` menampilkan bantuan bot
-- `/new` membuat email baru seperti `andipakukediri99@pokemail.net`
+- `/new` membuat email baru seperti `andipakukediri99@sharebot.net`
 - `/history` menampilkan history email user
-- `/delete email@pokemail.net` menghapus 1 email dari history
-- `/note email@pokemail.net catatan` menambah catatan untuk email tertentu
-- `/inbox email@pokemail.net` membuka inbox email itu
-- `/refresh email@pokemail.net` mengambil inbox terbaru untuk email itu
-- `/import email@pokemail.net` memulihkan email lama atau email dari luar bot selama domain masih didukung
+- `/delete email@domain.tld` menghapus 1 email dari history
+- `/note email@domain.tld catatan` menambah catatan untuk email tertentu
+- `/inbox email@domain.tld` membuka inbox email itu
+- `/refresh email@domain.tld` mengambil inbox terbaru untuk email itu
+- `/import email@domain.tld password` memulihkan email lama atau email dari luar bot selama domain masih didukung
 - tombol inline `Inbox`, `Refresh`, `History`, `Hapus History Email`, dan `Pembelian 5k/bulan` ikut dikirim di pesan bot
 
 ### History email
@@ -97,7 +95,7 @@ curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<w
 - saat history penuh, bot menolak generate/import email baru dan menampilkan pesan error
 - tombol `Pembelian 5k/bulan` langsung diarahkan ke `https://t.me/AndiPradanaAr`
 - setiap email history bisa punya catatan sendiri
-- email welcome bawaan saat inbox pertama dibuat akan dibersihkan otomatis
+- untuk email luar bot, password akun harus ikut disertakan saat import pertama kali
 
 Cloudflare Durable Object dipakai untuk menyimpan history email per chat.
 
@@ -182,9 +180,8 @@ npm run deploy
 
 ## Catatan
 
-- Tidak perlu API key untuk Guerrilla Mail
-- Worker menyimpan session Guerrilla Mail di cookie `TEMPMGEN_GMSESSID` agar nanti bisa dipakai untuk inbox/check email
-- App ini sengaja mengunci domain ke `@pokemail.net`
-- `actualEmail` dari Guerrilla bisa berbeda domain, tetapi inbox session tetap dipakai untuk menerima email
+- Tidak perlu API key untuk `mail.tm`
+- Worker membuat akun email sementara dan mengambil JWT token dari `mail.tm`
+- Domain email mengikuti daftar aktif dari `mail.tm`
 - Webhook Telegram ada di `/telegram/webhook`
 - History email Telegram disimpan di Durable Object `TempMGenState`
