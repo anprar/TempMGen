@@ -5,6 +5,8 @@ Web app sederhana untuk:
 - generate email otomatis dengan pola `namaorang + benda + kota + angka 0-99`
 - kunci domain output ke `@pokemail.net`
 - pakai session Guerrilla Mail di balik Worker
+- terima update Telegram lewat webhook Worker
+- sediakan command bot `/start`, `/new`, `/inbox`, `/refresh`, dan `/import`
 
 ## Stack
 
@@ -32,6 +34,51 @@ Contoh hasil:
 - `GET /api/domains`
 - `POST /api/create`
 - `GET /api/health`
+- `POST /telegram/webhook`
+
+## Telegram Bot
+
+Command yang sudah aktif:
+
+- `/start`
+- `/new`
+- `/inbox`
+- `/refresh`
+- `/import`
+
+### Secret yang dipakai Worker
+
+- `TELEGRAM_BOT_TOKEN` wajib
+- `TELEGRAM_WEBHOOK_SECRET` opsional tapi direkomendasikan
+
+### Set webhook Telegram
+
+Setelah Worker ter-deploy dan secret bot sudah terisi, arahkan webhook Telegram ke:
+
+```text
+https://<worker-url>/telegram/webhook
+```
+
+Tanpa webhook secret:
+
+```bash
+curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<worker-url>/telegram/webhook"
+```
+
+Dengan webhook secret:
+
+```bash
+curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<worker-url>/telegram/webhook&secret_token=<TELEGRAM_WEBHOOK_SECRET>"
+```
+
+### Flow command saat ini
+
+- `/start` menampilkan bantuan bot
+- `/new` membuat email baru seperti `andipakukediri99@pokemail.net`
+- `/inbox email@pokemail.net` membuka inbox email itu
+- `/refresh email@pokemail.net` mengambil inbox terbaru untuk email itu
+- `/import email@pokemail.net` memulihkan email lama agar bisa dipakai lagi di bot
+- tombol inline `Inbox` dan `Refresh` ikut dikirim di pesan bot agar tidak perlu ketik ulang email
 
 ## GitHub Actions Auto Deploy
 
@@ -78,6 +125,12 @@ Karena token sempat dipaste di chat, sebaiknya:
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 ```
 
+Webhook secret opsional:
+
+```bash
+npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
+```
+
 Kalau nanti kamu mau sinkronkan secret Telegram lewat GitHub Actions juga, saya bisa tambahkan step khusus setelah kamu menyiapkan secret GitHub `TELEGRAM_BOT_TOKEN`.
 
 ## Jalankan lokal
@@ -99,3 +152,4 @@ npm run deploy
 - Worker menyimpan session Guerrilla Mail di cookie `TEMPMGEN_GMSESSID` agar nanti bisa dipakai untuk inbox/check email
 - App ini sengaja mengunci domain ke `@pokemail.net`
 - `actualEmail` dari Guerrilla bisa berbeda domain, tetapi inbox session tetap dipakai untuk menerima email
+- Webhook Telegram ada di `/telegram/webhook`
