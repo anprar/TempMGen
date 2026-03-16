@@ -8,6 +8,7 @@ Web app sederhana untuk:
 - terima update Telegram lewat webhook Worker
 - sediakan command bot `/start`, `/new`, `/history`, `/delete`, `/note`, `/inbox`, `/refresh`, dan `/import`
 - simpan history email Telegram dengan batas default 5, premium 25, dan admin unlimited
+- tampilkan saran password, VCC dummy, dan OTP yang terdeteksi saat perlu
 
 ## Stack
 
@@ -85,7 +86,7 @@ curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<w
 - `/note email@pokemail.net catatan` menambah catatan untuk email tertentu
 - `/inbox email@pokemail.net` membuka inbox email itu
 - `/refresh email@pokemail.net` mengambil inbox terbaru untuk email itu
-- `/import email@pokemail.net` memulihkan email lama agar bisa dipakai lagi di bot
+- `/import email@pokemail.net` memulihkan email lama atau email dari luar bot selama domain masih didukung
 - tombol inline `Inbox`, `Refresh`, `History`, `Hapus History Email`, dan `Pembelian 5k/bulan` ikut dikirim di pesan bot
 
 ### History email
@@ -96,6 +97,7 @@ curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<w
 - saat history penuh, bot menolak generate/import email baru dan menampilkan pesan error
 - tombol `Pembelian 5k/bulan` langsung diarahkan ke `https://t.me/AndiPradanaAr`
 - setiap email history bisa punya catatan sendiri
+- email welcome bawaan saat inbox pertama dibuat akan dibersihkan otomatis
 
 Cloudflare Durable Object dipakai untuk menyimpan history email per chat.
 
